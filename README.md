@@ -1,1 +1,0 @@
-# crustdata-build-challenge
