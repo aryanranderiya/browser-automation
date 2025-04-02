@@ -23,7 +23,7 @@ class BrowserAction:
         """Execute a browser command and return result with status"""
         action = command.get("command_type")
         result = {"success": False, "message": "", "command": action}
-
+        time.sleep(3)
         try:
             if action == "navigate":
                 url = command.get("url", "")
@@ -48,15 +48,87 @@ class BrowserAction:
                 query = command.get("query")
                 self.logger.info(f"Searching {query} in {selector}")
 
+                # First check if we need to navigate before searching
+                current_url = self.page.url
+                if current_url == "about:blank" or not current_url:
+                    # Capture a screenshot to show the current state
+                    screenshot_path = (
+                        f"/tmp/blank_page_screenshot_{int(time.time())}.png"
+                    )
+                    await self.page.screenshot(path=screenshot_path)
+
+                    # Instead of failing immediately, provide a more helpful response
+                    self.logger.warning(
+                        f"Cannot search on blank page. Taking screenshot to {screenshot_path}"
+                    )
+                    result["success"] = False
+                    result["message"] = (
+                        "Cannot search on an empty page. A navigation command is required first."
+                    )
+                    result["needs_navigation"] = True
+                    result["screenshot_path"] = screenshot_path
+                    return result
+
+                # Take a screenshot before trying to search for debugging
+                debug_screenshot = f"/tmp/pre_search_debug_{int(time.time())}.png"
+                await self.page.screenshot(path=debug_screenshot)
+
+                # Make sure page is fully loaded
                 try:
+                    await self.page.wait_for_load_state(
+                        "domcontentloaded", timeout=self.timeout * 1000
+                    )
+                    self.logger.info("Page DOM loaded, now checking for selector")
+                except PlaywrightTimeoutError:
+                    error_msg = "Timeout waiting for page to load before searching"
+                    result["message"] = error_msg
+                    result["screenshot_path"] = debug_screenshot
+                    raise TimeoutError(error_msg, {"query": query})
+
+                # Now wait for selector with better error handling
+                try:
+                    self.logger.info(f"Looking for search selector: {selector}")
                     await self.page.wait_for_selector(
                         selector, timeout=self.timeout * 1000
                     )
                 except PlaywrightTimeoutError:
-                    error_msg = f"Search element with selector '{selector}' not found"
+                    # For debugging - print all available input elements
+                    try:
+                        input_elements = await self.page.evaluate("""
+                            () => {
+                                const inputs = Array.from(document.querySelectorAll('input'));
+                                return inputs.map(input => {
+                                    return {
+                                        name: input.name,
+                                        id: input.id,
+                                        type: input.type,
+                                        placeholder: input.placeholder
+                                    };
+                                });
+                            }
+                        """)
+                        input_selectors = []
+                        for inp in input_elements:
+                            if inp.get("id"):
+                                input_selectors.append(f"#{inp['id']}")
+                            if inp.get("name"):
+                                input_selectors.append(f"input[name='{inp['name']}']")
+
+                        self.logger.error(f"Available input elements: {input_elements}")
+                        self.logger.error(
+                            f"Possible selectors to use: {input_selectors}"
+                        )
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error while trying to list available inputs: {str(e)}"
+                        )
+
+                    error_msg = f"Search element with selector '{selector}' not found on page: {current_url}"
                     result["message"] = error_msg
+                    result["screenshot_path"] = debug_screenshot
                     raise ElementNotFoundError(error_msg, {"selector": selector})
 
+                # Fill and submit the search
                 await self.page.fill(selector, query)
                 await self.page.press(selector, "Enter")
 
@@ -147,6 +219,36 @@ class BrowserAction:
                     # This flag will be used by the caller to determine if user interaction is needed
                     "waiting_for_user": True,
                 }
+
+            elif action == "wait_for_page_load":
+                timeout = command.get(
+                    "timeout", 10000
+                )  # Default 10 seconds in milliseconds
+                self.logger.info(
+                    f"Waiting for page to load completely, timeout: {timeout}ms"
+                )
+
+                try:
+                    # Wait for DOM content to be loaded
+                    await self.page.wait_for_load_state(
+                        "domcontentloaded", timeout=timeout
+                    )
+                    self.logger.info("Page DOM content loaded")
+
+                    # Wait for network to be idle (no active connections for at least 500ms)
+                    await self.page.wait_for_load_state("networkidle", timeout=timeout)
+                    self.logger.info("Network idle, page fully loaded")
+
+                    result["success"] = True
+                    result["message"] = "Page fully loaded"
+                except PlaywrightTimeoutError as e:
+                    error_msg = f"Timeout waiting for page to load completely: {str(e)}"
+                    self.logger.warning(error_msg)
+                    # We don't want to fail the entire command chain if this times out
+                    # Sometimes pages have long-running connections
+                    result["success"] = True
+                    result["message"] = "Page load wait timed out, but continuing"
+                    result["warning"] = error_msg
 
             elif action == "extract_text":
                 selector = command.get("selector", "body")

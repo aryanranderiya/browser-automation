@@ -172,121 +172,145 @@ class BrowserSession:
         )
 
         try:
-            # Get current page context if we've loaded a page
-            page_structure = None
-            current_url = self.page.url if self.page else ""
+            # Store the original user input for potential reuse in sequential commands
+            original_input = command.user_input
+            command_chain_results = []
 
-            if current_url and not current_url.startswith("about:"):
-                page_structure = await extract_page_structure(self.page)
-                self.logger.info(f"Extracted page structure from {current_url}")
+            # Execute commands sequentially, with each new command based on the current page state
+            while True:
+                # Get current page context if we've loaded a page
+                page_structure = None
+                current_url = self.page.url if self.page else ""
+                self.logger.info(f"{current_url=}")
 
-            # Get commands from LLM
-            browser_commands = get_browser_commands(command.user_input, page_structure)
-            results = []
+                if current_url and not current_url.startswith("about:"):
+                    # Parse the current page to understand its structure
+                    page_structure = await extract_page_structure(self.page)
+                    self.logger.info(f"Extracted page structure from {current_url}")
 
-            # Create an instance of BrowserAction to handle command execution
-            action_executor = BrowserAction(self.page, timeout=self.timeout)
+                # Get the next single command from LLM based on current page state
+                browser_commands = get_browser_commands(
+                    original_input
+                    if len(command_chain_results) == 0
+                    else f"Continue with task: {original_input}\nPrevious steps: {command_chain_results}",
+                    page_structure,
+                )
 
-            for cmd in browser_commands:
-                action = cmd.get("command_type", "")
-                self.logger.info(f"Processing action: {action}")
+                if not browser_commands:
+                    break  # No more commands to execute
 
-                # Handle the wait_for_captcha action specially since it needs the Event object
-                if action == "wait_for_captcha":
-                    message = cmd.get(
-                        "message",
-                        "Captcha detected. Please solve the captcha in the browser window.",
-                    )
-                    self.logger.info("Waiting for user to solve captcha")
+                # Create an instance of BrowserAction to handle command execution
+                action_executor = BrowserAction(self.page, timeout=self.timeout)
 
-                    # Reset the event (in case it was set previously)
-                    self.captcha_resolved.clear()
+                # Execute each command in the sequence (should be 1 or 2 with wait_for_page_load)
+                for cmd in browser_commands:
+                    action = cmd.get("command_type", "")
+                    self.logger.info(f"Processing action: {action}")
 
-                    # Take a screenshot to show the captcha
-                    screenshot_path = await self.take_screenshot()
+                    # Handle the wait_for_captcha action specially since it needs the Event object
+                    if action == "wait_for_captcha":
+                        message = cmd.get(
+                            "message",
+                            "Captcha detected. Please solve the captcha in the browser window.",
+                        )
+                        self.logger.info("Waiting for user to solve captcha")
 
-                    if self.wait_for_captcha:
-                        # Wait for the captcha to be resolved - this will be resumed via the API
-                        result = {
-                            "success": True,
-                            "message": message,
-                            "command": action,
-                            "waiting_for_user": True,
-                            "screenshot_path": screenshot_path,
-                        }
+                        # Reset the event (in case it was set previously)
+                        self.captcha_resolved.clear()
 
-                        # Wait for the event to be set
-                        try:
-                            # Set a reasonable timeout (e.g., 5 minutes)
-                            await asyncio.wait_for(
-                                self.captcha_resolved.wait(), timeout=300
-                            )
-                            # Add success message that captcha was resolved
-                            result["message"] = (
-                                "Captcha resolved by user. Continuing execution."
-                            )
-                        except asyncio.TimeoutError:
-                            result["success"] = False
-                            result["message"] = (
-                                "Timed out waiting for captcha resolution"
-                            )
+                        # Take a screenshot to show the captcha
+                        screenshot_path = await self.take_screenshot()
+
+                        if self.wait_for_captcha:
+                            # Wait for the captcha to be resolved - this will be resumed via the API
+                            result = {
+                                "success": True,
+                                "message": message,
+                                "command": action,
+                                "waiting_for_user": True,
+                                "screenshot_path": screenshot_path,
+                            }
+
+                            # Wait for the event to be set
+                            try:
+                                await asyncio.wait_for(
+                                    self.captcha_resolved.wait(), timeout=300
+                                )  # 5 minute timeout
+                                self.logger.info(
+                                    "Captcha resolution received, continuing execution"
+                                )
+                                result["message"] = (
+                                    "Captcha solved, continuing with automation"
+                                )
+                            except asyncio.TimeoutError:
+                                self.logger.warning(
+                                    "Timeout waiting for captcha resolution"
+                                )
+                                result["message"] = (
+                                    "Timeout waiting for captcha to be solved"
+                                )
+                                result["success"] = False
+                        else:
+                            # If wait_for_captcha is False, just log and continue without waiting
+                            result = {
+                                "success": False,
+                                "message": "Captcha detected but automatic waiting is disabled. Enable 'wait_for_captcha' to pause execution.",
+                                "command": action,
+                                "screenshot_path": screenshot_path,
+                            }
                     else:
-                        # If wait_for_captcha is False, just log and continue without waiting
-                        result = {
-                            "success": False,
-                            "message": "Captcha detected but automatic waiting is disabled. Enable 'wait_for_captcha' to pause execution.",
-                            "command": action,
-                            "screenshot_path": screenshot_path,
-                        }
-                else:
-                    # For all other actions, use the BrowserAction executor
-                    try:
-                        result = await action_executor.execute(cmd)
-                    except Exception as e:
-                        self.logger.error(f"Error executing action {action}: {str(e)}")
-                        result = {
-                            "success": False,
-                            "message": f"Error executing {action}: {str(e)}",
-                            "command": action,
-                        }
+                        # For all other actions, use the BrowserAction executor
+                        try:
+                            self.logger.info(f"Executing command: {cmd}")
+                            result = await action_executor.execute(cmd)
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error executing action {action}: {str(e)}"
+                            )
+                            result = {
+                                "success": False,
+                                "message": f"Error executing {action}: {str(e)}",
+                                "command": action,
+                            }
 
-                results.append(result)
+                    command_chain_results.append(result)
 
-                # If this action failed and it's critical (like navigation), stop processing
-                if not result["success"] and action in ["navigate", "click", "fill"]:
-                    self.logger.warning(
-                        f"Critical action {action} failed, stopping command execution"
-                    )
-                    break
+                    # If this action failed and it's critical (like navigation), stop processing
+                    if not result["success"] and action in [
+                        "navigate",
+                        "click",
+                        "fill",
+                    ]:
+                        self.logger.warning(
+                            f"Critical action {action} failed, stopping command execution"
+                        )
+                        break
 
-                # If we're waiting for captcha and the action was successful, don't process any further commands
-                if action == "wait_for_captcha" and result.get(
-                    "waiting_for_user", False
-                ):
-                    self.logger.info(
-                        "Pausing command execution while waiting for captcha resolution"
-                    )
-                    break
+                    # If we're waiting for captcha and the action was successful, don't process any further commands
+                    if action == "wait_for_captcha" and result.get(
+                        "waiting_for_user", False
+                    ):
+                        self.logger.info(
+                            "Pausing command execution while waiting for captcha resolution"
+                        )
+                        break
 
-            # Take a screenshot after command execution
-            screenshot_path = await self.take_screenshot()
+                # Take a screenshot after command execution
+                screenshot_path = await self.take_screenshot()
 
-            # If we didn't have page structure before but we do now, extract it
-            if (
-                not page_structure
-                and self.page.url
-                and not (self.page.url).startswith("about:")
-            ):
-                page_structure = await extract_page_structure(self.page)
+                # Check if the task is complete or if we need more commands
+                # For now, we'll stop after the first command for simplicity
+                # In a more advanced version, this could ask the LLM if the task is complete
+                break  # Remove this in a more advanced implementation
 
             # Generate an explanation of what was done
             explanation = self._generate_explanation(
-                command.user_input, results, page_structure
+                command.user_input, command_chain_results, page_structure
             )
 
             return {
                 "status": "success",
-                "results": results,
+                "results": command_chain_results,
                 "explanation": explanation,
                 "screenshot_path": screenshot_path,
             }
@@ -509,9 +533,9 @@ session_manager = BrowserSessionManager()
 
 
 # Start background cleanup task
-async def start_cleanup_task():
-    await session_manager.cleanup_inactive_sessions()
+# async def start_cleanup_task():
+# await session_manager.cleanup_inactive_sessions()
+#
 
-
-# Initialize cleanup task when module is imported
-asyncio.create_task(start_cleanup_task())
+# # Initialize cleanup task when module is imported
+# asyncio.create_task(start_cleanup_task())
