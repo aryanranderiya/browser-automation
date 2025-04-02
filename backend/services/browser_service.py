@@ -1,16 +1,8 @@
-import json
-import os
 import time
-from typing import Dict, List, Optional, Union
+from typing import Dict
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
-from openai import OpenAI
-from playwright.async_api import (
-    async_playwright,
-    TimeoutError as PlaywrightTimeoutError,
-)
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from utils.logger import setup_logger
 from utils.browser_utils import (
     BrowserAutomationError,
@@ -19,33 +11,6 @@ from utils.browser_utils import (
     TimeoutError,
     ExtractorError,
 )
-from prompts.system_prompt import system_prompt
-
-load_dotenv()
-router = APIRouter()
-logger = setup_logger("interact")
-
-client = OpenAI(
-    base_url="https://api.groq.com/openai/v1", api_key=os.environ.get("GROQ_API_KEY")
-)
-
-
-class InteractionRequest(BaseModel):
-    user_input: str
-    timeout: Optional[int] = Field(default=30, description="Global timeout in seconds")
-    headless: Optional[bool] = Field(
-        default=False, description="Run browser in headless mode"
-    )
-    browser_type: Optional[str] = Field(
-        default="chromium", description="Browser to use: chromium, firefox, or webkit"
-    )
-
-
-class InteractionResponse(BaseModel):
-    status: str
-    message: str
-    details: Optional[Dict] = None
-    screenshot_path: Optional[str] = None
 
 
 class BrowserAction:
@@ -159,6 +124,29 @@ class BrowserAction:
                 result["success"] = True
                 result["message"] = "Screenshot captured"
                 result["screenshot_path"] = path
+
+            elif action == "wait_for_captcha":
+                message = command.get(
+                    "message",
+                    "Captcha detected. Please solve the captcha in the browser window.",
+                )
+                self.logger.info("Detected captcha, waiting for user resolution")
+
+                # Take a screenshot to show the captcha
+                filename = f"captcha_screenshot_{int(time.time())}.png"
+                path = f"/tmp/{filename}"
+                await self.page.screenshot(path=path)
+
+                # Since BrowserAction doesn't have access to the Event object for signaling,
+                # we can only return a result indicating captcha was detected
+                result = {
+                    "success": True,
+                    "message": message,
+                    "command": action,
+                    "screenshot_path": path,
+                    # This flag will be used by the caller to determine if user interaction is needed
+                    "waiting_for_user": True,
+                }
 
             elif action == "extract_text":
                 selector = command.get("selector", "body")
@@ -359,346 +347,3 @@ class BrowserAction:
             )
 
         return result
-
-
-def get_browser_commands(user_input: str, page_structure=None) -> List[Dict]:
-    """Convert natural language to structured browser commands using LLM"""
-    logger.info(f"Generating browser commands for input: {user_input}")
-
-    try:
-        system_content = system_prompt
-        user_content = user_input
-
-        if page_structure:
-            page_info = json.dumps(page_structure, indent=2)
-            user_content = f"""Page structure information:
-            ```json
-            {page_info}
-            ```
-
-Based on the above page structure, please help with this task: {user_input}
-
-IMPORTANT: Only use selectors that exist in the page structure for interaction commands."""
-
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content},
-            ],
-            response_format={"type": "json_object"},
-        )
-
-        content = response.choices[0].message.content
-        logger.info("Received JSON response from LLM")
-
-        parsed_response = json.loads(content)
-        commands = parsed_response.get("commands", [])
-
-        if not commands:
-            logger.warning("No commands generated from user input")
-
-        return commands
-
-    except Exception as e:
-        logger.error(f"Error generating browser commands: {str(e)}")
-        raise Exception(f"Failed to generate browser commands: {str(e)}")
-
-
-async def execute_browser_interaction(
-    request: InteractionRequest,
-) -> InteractionResponse:
-    """Execute browser interactions based on natural language commands"""
-    logger.info(f"Processing interaction request: {request.user_input}")
-    command_results = []
-    screenshot_path = None
-    page_structure = None
-
-    try:
-        async with async_playwright() as p:
-            browser_types = {
-                "chromium": p.chromium,
-                "firefox": p.firefox,
-                "webkit": p.webkit,
-            }
-
-            browser_type = request.browser_type.lower()
-            if browser_type not in browser_types:
-                browser_type = "chromium"
-
-            browser = await browser_types[browser_type].launch(
-                headless=request.headless
-            )
-            page = await browser.new_page()
-
-            action_executor = BrowserAction(page, timeout=request.timeout)
-
-            initial_commands = get_browser_commands(request.user_input)
-
-            initial_nav_commands = [
-                cmd for cmd in initial_commands if cmd.get("command_type") == "navigate"
-            ]
-
-            if initial_nav_commands:
-                first_nav = initial_nav_commands[0]
-                nav_result = await action_executor.execute(first_nav)
-                command_results.append(nav_result)
-
-                if nav_result["success"]:
-                    from utils.browser_utils import extract_page_structure
-
-                    page_structure = await extract_page_structure(page)
-                    logger.info(
-                        f"Extracted page structure with {len(page_structure.get('interactiveElements', {}).get('inputs', []))} inputs, "
-                        + f"{len(page_structure.get('interactiveElements', {}).get('buttons', []))} buttons, "
-                        + f"{len(page_structure.get('interactiveElements', {}).get('links', []))} links"
-                    )
-
-                    commands = get_browser_commands(request.user_input, page_structure)
-
-                    commands = [
-                        cmd
-                        for cmd in commands
-                        if not (
-                            cmd.get("command_type") == "navigate"
-                            and cmd.get("url") == first_nav.get("url")
-                        )
-                    ]
-                else:
-                    commands = [cmd for cmd in initial_commands if cmd != first_nav]
-            else:
-                commands = initial_commands
-
-            for command in commands:
-                if command["command_type"] == "navigate" and any(
-                    r.get("command") == "navigate" for r in command_results
-                ):
-                    continue
-
-                result = await action_executor.execute(command)
-                command_results.append(result)
-
-                if (
-                    command["command_type"] == "navigate"
-                    and result["success"]
-                    and not page_structure
-                ):
-                    from utils.browser_utils import extract_page_structure
-
-                    page_structure = await extract_page_structure(page)
-                    logger.info("Extracted page structure after navigation")
-
-                if not result["success"] and command["command_type"] not in [
-                    "wait",
-                    "screenshot",
-                ]:
-                    logger.warning(f"Command failed: {result['message']}")
-
-                if result.get("screenshot_path"):
-                    screenshot_path = result["screenshot_path"]
-
-            if not screenshot_path:
-                filename = f"final_screenshot_{int(time.time())}.png"
-                path = f"/tmp/{filename}"
-                await page.screenshot(path=path)
-                screenshot_path = path
-
-            await browser.close()
-
-        success_count = sum(1 for result in command_results if result["success"])
-        status = "success" if success_count == len(command_results) else "partial"
-        if success_count == 0:
-            status = "error"
-
-        return InteractionResponse(
-            status=status,
-            message=f"Executed {success_count}/{len(command_results)} commands successfully",
-            details={"results": command_results},
-            screenshot_path=screenshot_path,
-        )
-
-    except Exception as e:
-        logger.error(f"Error in browser interaction: {str(e)}")
-        return InteractionResponse(
-            status="error",
-            message=f"Error during browser interaction: {str(e)}",
-            details={"error": str(e)},
-        )
-
-
-class ExtractRequest(BaseModel):
-    url: str
-    extraction_type: str = Field(
-        ...,
-        description="Type of extraction: 'text', 'links', 'table', 'elements', 'json'",
-    )
-    selector: Optional[str] = Field(
-        default=None, description="CSS selector to target specific elements"
-    )
-    attributes: Optional[List[str]] = Field(
-        default=None, description="Attributes to extract from elements"
-    )
-    timeout: Optional[int] = Field(default=30, description="Global timeout in seconds")
-    headless: Optional[bool] = Field(
-        default=True, description="Run browser in headless mode"
-    )
-    browser_type: Optional[str] = Field(
-        default="chromium", description="Browser to use: chromium, firefox, or webkit"
-    )
-
-
-class ExtractResponse(BaseModel):
-    status: str
-    message: str
-    data: Optional[Union[Dict, List, str]] = None
-    screenshot_path: Optional[str] = None
-
-
-async def execute_data_extraction(
-    request: ExtractRequest,
-) -> ExtractResponse:
-    """Execute data extraction from a webpage"""
-    logger.info(f"Processing extraction request for URL: {request.url}")
-
-    try:
-        command = {
-            "command_type": f"extract_{request.extraction_type}",
-        }
-
-        if request.selector:
-            command["selector"] = request.selector
-
-        if request.attributes and request.extraction_type == "elements":
-            command["attributes"] = request.attributes
-
-        async with async_playwright() as p:
-            browser_types = {
-                "chromium": p.chromium,
-                "firefox": p.firefox,
-                "webkit": p.webkit,
-            }
-
-            browser_type = request.browser_type.lower()
-            if browser_type not in browser_types:
-                browser_type = "chromium"
-
-            browser = await browser_types[browser_type].launch(
-                headless=request.headless
-            )
-            page = await browser.new_page()
-
-            action_executor = BrowserAction(page, timeout=request.timeout)
-
-            navigate_command = {
-                "command_type": "navigate",
-                "url": request.url,
-            }
-            navigate_result = await action_executor.execute(navigate_command)
-
-            if not navigate_result["success"]:
-                await browser.close()
-                return ExtractResponse(
-                    status="error",
-                    message=f"Failed to navigate to URL: {navigate_result['message']}",
-                )
-
-            extract_result = await action_executor.execute(command)
-
-            filename = f"extract_screenshot_{int(time.time())}.png"
-            path = f"/tmp/{filename}"
-            await page.screenshot(path=path)
-
-            await browser.close()
-
-        if extract_result["success"]:
-            return ExtractResponse(
-                status="success",
-                message=extract_result["message"],
-                data=extract_result.get("data"),
-                screenshot_path=path,
-            )
-        else:
-            return ExtractResponse(
-                status="error",
-                message=extract_result["message"],
-                screenshot_path=path,
-            )
-
-    except Exception as e:
-        logger.error(f"Error in data extraction: {str(e)}")
-        return ExtractResponse(
-            status="error",
-            message=f"Error during data extraction: {str(e)}",
-        )
-
-
-@router.post("/extract", response_model=ExtractResponse)
-async def extract(request: ExtractRequest):
-    """
-    API endpoint to extract data from web pages
-
-    Example input for extracting links:
-    {
-        "url": "https://example.com",
-        "extraction_type": "links",
-        "selector": "a.product-link",
-        "timeout": 30,
-        "headless": true
-    }
-
-    Example input for extracting table data:
-    {
-        "url": "https://example.com/table-page",
-        "extraction_type": "table",
-        "selector": "table.data-table",
-        "timeout": 30
-    }
-
-    Example input for extracting specific elements:
-    {
-        "url": "https://example.com/products",
-        "extraction_type": "elements",
-        "selector": ".product-card",
-        "attributes": ["innerText", "data-product-id", "data-price"],
-        "timeout": 30
-    }
-    """
-    try:
-        logger.info(
-            f"Received extraction request for URL: {request.url}, type: {request.extraction_type}"
-        )
-
-        response = await execute_data_extraction(request)
-
-        return response
-
-    except Exception as e:
-        logger.error(f"Error in extraction API: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/interact", response_model=InteractionResponse)
-async def interact(request: InteractionRequest, background_tasks: BackgroundTasks):
-    """
-    API endpoint to handle natural language browser interactions
-
-    Example input:
-    {
-        "user_input": "Log into Twitter using my account example@gmail.com with password mysecretpass123",
-        "timeout": 45,
-        "headless": false,
-        "browser_type": "chromium"
-    }
-    """
-    try:
-        logger.info(
-            f"Received interaction request with parameters: timeout={request.timeout}s, headless={request.headless}"
-        )
-
-        response = await execute_browser_interaction(request)
-
-        return response
-
-    except Exception as e:
-        logger.error(f"Error in interaction API: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))

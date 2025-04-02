@@ -6,18 +6,12 @@ from playwright.async_api import async_playwright, Browser, Page
 from pydantic import BaseModel
 from utils.logger import setup_logger
 from utils.browser_utils import extract_page_structure
-from prompts.system_prompt import system_prompt
-import os
-import json
-from openai import OpenAI
+from services.command_service import get_browser_commands
+from services.browser_service import BrowserAction
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = setup_logger("browser_session")
-
-client = OpenAI(
-    base_url="https://api.groq.com/openai/v1", api_key=os.environ.get("GROQ_API_KEY")
-)
 
 
 class BrowserCommand(BaseModel):
@@ -35,12 +29,17 @@ class BrowserSession:
     """Manages a persistent browser session with command queue"""
 
     def __init__(
-        self, browser_type: str = "chromium", headless: bool = False, timeout: int = 30
+        self,
+        browser_type: str = "chromium",
+        headless: bool = False,
+        timeout: int = 30,
+        wait_for_captcha: bool = False,
     ):
         self.session_id = str(uuid.uuid4())
         self.browser_type = browser_type
         self.headless = headless
         self.timeout = timeout
+        self.wait_for_captcha = wait_for_captcha
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
         self.command_queue: List[BrowserCommand] = []
@@ -51,6 +50,7 @@ class BrowserSession:
         self.session_data: Dict[str, Any] = {}  # Store session state like login info
         self.logger = setup_logger(f"session_{self.session_id[:8]}")
         self.screenshot_path: Optional[str] = None
+        self.captcha_resolved: asyncio.Event = asyncio.Event()
 
     async def start(self):
         """Start the browser session"""
@@ -147,9 +147,10 @@ class BrowserSession:
                 [cmd for cmd in self.command_queue if not cmd.processed]
             ),
             "last_activity": self.last_activity,
-            "current_url": await self.page.url()
-            if self.page and self.is_active
-            else None,
+            # "current_url": await self.page.url()
+            # if self.page and self.is_active
+            # else None,
+            "current_url": self.page.url if self.page and self.is_active else None,
             "screenshot_path": self.screenshot_path,
         }
 
@@ -173,116 +174,81 @@ class BrowserSession:
         try:
             # Get current page context if we've loaded a page
             page_structure = None
-            current_url = await self.page.url() if self.page else ""
+            current_url = self.page.url if self.page else ""
 
             if current_url and not current_url.startswith("about:"):
                 page_structure = await extract_page_structure(self.page)
                 self.logger.info(f"Extracted page structure from {current_url}")
 
             # Get commands from LLM
-            browser_commands = self._get_browser_commands(
-                command.user_input, page_structure
-            )
+            browser_commands = get_browser_commands(command.user_input, page_structure)
             results = []
+
+            # Create an instance of BrowserAction to handle command execution
+            action_executor = BrowserAction(self.page, timeout=self.timeout)
 
             for cmd in browser_commands:
                 action = cmd.get("command_type", "")
                 self.logger.info(f"Processing action: {action}")
 
-                try:
-                    if action == "navigate":
-                        url = cmd.get("url", "")
-                        if not url.startswith(("http://", "https://")):
-                            url = f"https://{url}"
+                # Handle the wait_for_captcha action specially since it needs the Event object
+                if action == "wait_for_captcha":
+                    message = cmd.get(
+                        "message",
+                        "Captcha detected. Please solve the captcha in the browser window.",
+                    )
+                    self.logger.info("Waiting for user to solve captcha")
 
-                        self.logger.info(f"Navigating to {url}")
-                        response = await self.page.goto(
-                            url, timeout=self.timeout * 1000
-                        )
+                    # Reset the event (in case it was set previously)
+                    self.captcha_resolved.clear()
 
-                        if response and response.ok:
-                            result = {
-                                "success": True,
-                                "message": f"Successfully navigated to {url}",
-                                "command": action,
-                            }
-                        else:
-                            result = {
-                                "success": False,
-                                "message": f"Navigation to {url} failed or timed out",
-                                "command": action,
-                            }
+                    # Take a screenshot to show the captcha
+                    screenshot_path = await self.take_screenshot()
 
-                    elif action == "click":
-                        selector = cmd.get("selector")
-                        self.logger.info(f"Clicking element {selector}")
-
-                        await self.page.wait_for_selector(
-                            selector, timeout=self.timeout * 1000
-                        )
-                        await self.page.click(selector)
-
+                    if self.wait_for_captcha:
+                        # Wait for the captcha to be resolved - this will be resumed via the API
                         result = {
                             "success": True,
-                            "message": f"Clicked on element: {selector}",
+                            "message": message,
                             "command": action,
+                            "waiting_for_user": True,
+                            "screenshot_path": screenshot_path,
                         }
 
-                    elif action == "fill":
-                        selector = cmd.get("selector")
-                        value = cmd.get("value")
-                        self.logger.info(f"Filling {selector} with value")
-
-                        await self.page.wait_for_selector(
-                            selector, timeout=self.timeout * 1000
-                        )
-                        await self.page.fill(selector, value)
-
-                        result = {
-                            "success": True,
-                            "message": f"Filled {selector} with text",
-                            "command": action,
-                        }
-
-                    elif action == "wait":
-                        seconds = cmd.get("seconds", 2)
-                        self.logger.info(f"Waiting for {seconds} seconds")
-
-                        await self.page.wait_for_timeout(seconds * 1000)
-
-                        result = {
-                            "success": True,
-                            "message": f"Waited for {seconds} seconds",
-                            "command": action,
-                        }
-
-                    elif action == "extract_text":
-                        selector = cmd.get("selector", "body")
-                        self.logger.info(f"Extracting text from {selector}")
-
-                        text = await self.page.text_content(selector)
-
-                        result = {
-                            "success": True,
-                            "message": f"Extracted text from {selector}",
-                            "data": text,
-                            "command": action,
-                        }
-
+                        # Wait for the event to be set
+                        try:
+                            # Set a reasonable timeout (e.g., 5 minutes)
+                            await asyncio.wait_for(
+                                self.captcha_resolved.wait(), timeout=300
+                            )
+                            # Add success message that captcha was resolved
+                            result["message"] = (
+                                "Captcha resolved by user. Continuing execution."
+                            )
+                        except asyncio.TimeoutError:
+                            result["success"] = False
+                            result["message"] = (
+                                "Timed out waiting for captcha resolution"
+                            )
                     else:
+                        # If wait_for_captcha is False, just log and continue without waiting
                         result = {
                             "success": False,
-                            "message": f"Unsupported command type: {action}",
+                            "message": "Captcha detected but automatic waiting is disabled. Enable 'wait_for_captcha' to pause execution.",
+                            "command": action,
+                            "screenshot_path": screenshot_path,
+                        }
+                else:
+                    # For all other actions, use the BrowserAction executor
+                    try:
+                        result = await action_executor.execute(cmd)
+                    except Exception as e:
+                        self.logger.error(f"Error executing action {action}: {str(e)}")
+                        result = {
+                            "success": False,
+                            "message": f"Error executing {action}: {str(e)}",
                             "command": action,
                         }
-
-                except Exception as e:
-                    self.logger.error(f"Error executing action {action}: {str(e)}")
-                    result = {
-                        "success": False,
-                        "message": f"Error executing {action}: {str(e)}",
-                        "command": action,
-                    }
 
                 results.append(result)
 
@@ -293,14 +259,23 @@ class BrowserSession:
                     )
                     break
 
+                # If we're waiting for captcha and the action was successful, don't process any further commands
+                if action == "wait_for_captcha" and result.get(
+                    "waiting_for_user", False
+                ):
+                    self.logger.info(
+                        "Pausing command execution while waiting for captcha resolution"
+                    )
+                    break
+
             # Take a screenshot after command execution
             screenshot_path = await self.take_screenshot()
 
             # If we didn't have page structure before but we do now, extract it
             if (
                 not page_structure
-                and await self.page.url()
-                and not (await self.page.url()).startswith("about:")
+                and self.page.url
+                and not (self.page.url).startswith("about:")
             ):
                 page_structure = await extract_page_structure(self.page)
 
@@ -322,49 +297,6 @@ class BrowserSession:
                 "status": "error",
                 "message": f"Error during browser interaction: {str(e)}",
             }
-
-    def _get_browser_commands(self, user_input: str, page_structure=None) -> List[Dict]:
-        """Convert natural language to structured browser commands using LLM"""
-        self.logger.info(f"Generating browser commands for input: {user_input}")
-
-        try:
-            system_content = system_prompt
-            user_content = user_input
-
-            if page_structure:
-                page_info = json.dumps(page_structure, indent=2)
-                user_content = f"""Page structure information:
-                ```json
-                {page_info}
-                ```
-
-Based on the above page structure, please help with this task: {user_input}
-
-IMPORTANT: Only use selectors that exist in the page structure for interaction commands."""
-
-            response = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {"role": "system", "content": system_content},
-                    {"role": "user", "content": user_content},
-                ],
-                response_format={"type": "json_object"},
-            )
-
-            content = response.choices[0].message.content
-            self.logger.info("Received JSON response from LLM")
-
-            parsed_response = json.loads(content)
-            commands = parsed_response.get("commands", [])
-
-            if not commands:
-                self.logger.warning("No commands generated from user input")
-
-            return commands
-
-        except Exception as e:
-            self.logger.error(f"Error generating browser commands: {str(e)}")
-            return []
 
     def _generate_explanation(
         self, user_input: str, results: List[Dict], page_structure=None
@@ -392,6 +324,13 @@ IMPORTANT: Only use selectors that exist in the page structure for interaction c
                         action_descriptions.append("entered text into a field")
                     elif cmd_type == "wait":
                         action_descriptions.append("waited for the page to load")
+                    elif cmd_type == "wait_for_captcha":
+                        if action.get("waiting_for_user", False):
+                            action_descriptions.append(
+                                "paused execution for you to solve a captcha"
+                            )
+                        else:
+                            action_descriptions.append("detected a captcha")
                     elif cmd_type == "extract_text":
                         action_descriptions.append("extracted text content")
 
@@ -402,6 +341,13 @@ IMPORTANT: Only use selectors that exist in the page structure for interaction c
                     summary += " but "
                 summary += f"encountered {len(failed_actions)} error(s)"
 
+                # Check if one of the errors was a captcha detection but wait_for_captcha was disabled
+                captcha_errors = [
+                    a for a in failed_actions if a.get("command") == "wait_for_captcha"
+                ]
+                if captcha_errors and not self.wait_for_captcha:
+                    summary += ". A captcha was detected but automatic waiting is disabled. Enable 'wait_for_captcha' to pause execution when captchas are detected."
+
             # current_url = page_structure.get("url") if page_structure else "the page"
 
             if successful_actions and not failed_actions:
@@ -410,6 +356,13 @@ IMPORTANT: Only use selectors that exist in the page structure for interaction c
                 summary += ". The task was partially completed."
             else:
                 summary += ". The task could not be completed."
+
+            # Add specific info if we're waiting for captcha resolution
+            for action in results:
+                if action.get("command") == "wait_for_captcha" and action.get(
+                    "waiting_for_user", False
+                ):
+                    summary += " The browser is waiting for you to solve the captcha. Once solved, the automation will continue."
 
             return summary
 
@@ -464,11 +417,18 @@ class BrowserSessionManager:
         self.logger = setup_logger("session_manager")
 
     async def create_session(
-        self, browser_type: str = "chromium", headless: bool = False, timeout: int = 30
+        self,
+        browser_type: str = "chromium",
+        headless: bool = False,
+        timeout: int = 30,
+        wait_for_captcha: bool = False,
     ) -> str:
         """Create a new browser session and return session ID"""
         session = BrowserSession(
-            browser_type=browser_type, headless=headless, timeout=timeout
+            browser_type=browser_type,
+            headless=headless,
+            timeout=timeout,
+            wait_for_captcha=wait_for_captcha,
         )
         await session.start()
 

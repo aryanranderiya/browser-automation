@@ -29,6 +29,10 @@ Follow this JSON format strictly:
       "seconds": 5
     },
     {
+      "command_type": "wait_for_captcha",
+      "message": "Captcha detected. Please solve the captcha in the browser window."
+    },
+    {
       "command_type": "extract_text",
       "selector": ".product-description"
     },
@@ -59,6 +63,7 @@ IMPORTANT RULES:
 2. When the page structure is provided, analyze it to understand what elements are available on the page.
 3. If a requested element doesn't exist in the page structure, use extract_text or screenshot to gather more information instead of attempting to interact with non-existent elements.
 4. If you're unsure about a selector, prefer methods that take screenshots or extract page content to gather more information.
+5. If you detect a captcha or security challenge on the page (look for elements with text containing 'captcha', 'robot', 'human verification', 'security check'), use the 'wait_for_captcha' command.
 
 For navigation commands, always include the full URL. If a URL doesn't include "http://" or "https://", "https://" will be added automatically.
 
