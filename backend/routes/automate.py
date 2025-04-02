@@ -1,8 +1,11 @@
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
+from time import time
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
+from utils.browser_utils import extract_page_structure
 from utils.logger import setup_logger
 from utils.browser_session import session_manager
+from routes.interact import BrowserAction, get_browser_commands
 
 router = APIRouter(prefix="/automate", tags=["automation"])
 logger = setup_logger("automate_routes")
@@ -24,22 +27,16 @@ class SessionResponse(BaseModel):
     message: str
 
 
-class AddCommandRequest(BaseModel):
+class ExecuteCommandRequest(BaseModel):
     user_input: str = Field(
         ..., description="Natural language input describing what to do in the browser"
     )
 
 
 class CommandResponse(BaseModel):
-    command_id: str
     status: str
     message: str
-
-
-class CommandResultResponse(BaseModel):
-    status: str
-    message: str
-    result: Optional[Dict] = None
+    results: Optional[List[Dict]] = None
     screenshot_path: Optional[str] = None
 
 
@@ -102,76 +99,72 @@ async def stop_session(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/session/{session_id}/command", response_model=CommandResponse)
-async def add_command(session_id: str, request: AddCommandRequest):
+@router.post("/session/{session_id}/execute", response_model=CommandResponse)
+async def execute_command(session_id: str, request: ExecuteCommandRequest):
     """
-    Add a new command to the session's queue.
+    Execute a command in the browser session.
 
-    Commands are processed asynchronously in order. Use the returned command_id
-    to check the status and result of the command.
+    This directly executes the command and returns the result.
 
     Example: "Log into Instagram with username aryan and password 1234224"
     """
     try:
         logger.info(
-            f"Adding command to session {session_id}: {request.user_input[:50]}..."
+            f"Executing command in session {session_id}: {request.user_input[:50]}..."
         )
 
-        command_id = await session_manager.add_command(
-            session_id=session_id, user_input=request.user_input
-        )
-
-        if command_id:
-            return CommandResponse(
-                command_id=command_id,
-                status="pending",
-                message="Command added to queue and will be processed",
-            )
-        else:
+        # Get the session
+        session = await session_manager.get_session(session_id)
+        if not session or not session.is_active:
             raise HTTPException(
                 status_code=404, detail=f"Session {session_id} not found or not active"
             )
 
+        # Get the page
+        page = await session.get_page()
+        if not page:
+            raise HTTPException(status_code=400, detail="Browser page is not available")
+
+        # Create a BrowserAction instance for this page
+        action_executor = BrowserAction(page, timeout=session.timeout)
+
+        # Generate commands from the user input
+        commands = get_browser_commands(request.user_input)
+        command_results = []
+
+        # Execute each command
+        for command in commands:
+            result = await action_executor.execute(command)
+            command_results.append(result)
+
+            # Update last activity time
+            session.last_activity = time.time()
+
+            # If it was a navigation command, extract page structure
+            if command["command_type"] == "navigate" and result["success"]:
+                page_structure = await extract_page_structure(page)
+                logger.info("Extracted page structure after navigation")
+
+        # Take a screenshot after execution
+        screenshot_path = await session.take_screenshot()
+
+        # Calculate success rate
+        success_count = sum(1 for result in command_results if result["success"])
+        status = "success" if success_count == len(command_results) else "partial"
+        if success_count == 0:
+            status = "error"
+
+        return CommandResponse(
+            status=status,
+            message=f"Executed {success_count}/{len(command_results)} commands successfully",
+            results=command_results,
+            screenshot_path=screenshot_path,
+        )
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error adding command: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get(
-    "/session/{session_id}/command/{command_id}", response_model=CommandResultResponse
-)
-async def get_command_result(session_id: str, command_id: str):
-    """
-    Get the result of a command that was added to the queue.
-
-    This endpoint should be polled until the command is completed.
-    """
-    try:
-        logger.info(f"Getting result for command {command_id} in session {session_id}")
-
-        result = await session_manager.get_command_result(
-            session_id=session_id, command_id=command_id
-        )
-
-        if result.get("status") == "error":
-            raise HTTPException(
-                status_code=404,
-                detail=result.get("message", "Command or session not found"),
-            )
-
-        return CommandResultResponse(
-            status=result.get("status"),
-            message=result.get("message", ""),
-            result=result.get("result"),
-            screenshot_path=result.get("screenshot_path"),
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting command result: {str(e)}")
+        logger.error(f"Error executing command: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

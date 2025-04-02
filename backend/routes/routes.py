@@ -1,38 +1,44 @@
 import json
 import os
 import time
-import uuid
 from typing import Dict, List, Optional, Union
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from dotenv import load_dotenv
+from fastapi import APIRouter, HTTPException
 from openai import OpenAI
 from playwright.async_api import (
-    async_playwright,
     TimeoutError as PlaywrightTimeoutError,
 )
+from playwright.async_api import (
+    async_playwright,
+)
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
-from utils.logger import setup_logger
+from utils.browser_session import session_manager
 from utils.browser_utils import (
     BrowserAutomationError,
-    NavigationError,
     ElementNotFoundError,
-    TimeoutError,
     ExtractorError,
+    NavigationError,
+    TimeoutError,
+    extract_page_structure,
 )
-from prompts.system_prompt import system_prompt
+from utils.logger import setup_logger
 
 load_dotenv()
 router = APIRouter()
-logger = setup_logger("interact")
+logger = setup_logger("browser_automation")
 
 client = OpenAI(
     base_url="https://api.groq.com/openai/v1", api_key=os.environ.get("GROQ_API_KEY")
 )
 
 
-class InteractionRequest(BaseModel):
-    user_input: str
+# ================ Models ================
+
+
+class BrowserRequest(BaseModel):
+    """Base model for browser automation requests"""
+
     timeout: Optional[int] = Field(default=30, description="Global timeout in seconds")
     headless: Optional[bool] = Field(
         default=False, description="Run browser in headless mode"
@@ -42,14 +48,70 @@ class InteractionRequest(BaseModel):
     )
 
 
-class InteractionResponse(BaseModel):
+class SessionResponse(BaseModel):
+    """Response model for session operations"""
+
+    session_id: str
+    status: str
+    message: str
+    screenshot_path: Optional[str] = None
+
+
+class CommandRequest(BaseModel):
+    """Request model for executing commands"""
+
+    user_input: str = Field(
+        ..., description="Natural language input describing what to do in the browser"
+    )
+
+
+class CommandResponse(BaseModel):
+    """Response model for command execution"""
+
     status: str
     message: str
     details: Optional[Dict] = None
     screenshot_path: Optional[str] = None
 
 
+class ExtractRequest(BaseModel):
+    """Request model for data extraction"""
+
+    url: str
+    extraction_type: str = Field(
+        ...,
+        description="Type of extraction: 'text', 'links', 'table', 'elements', 'json'",
+    )
+    selector: Optional[str] = Field(
+        default=None, description="CSS selector to target specific elements"
+    )
+    attributes: Optional[List[str]] = Field(
+        default=None, description="Attributes to extract from elements"
+    )
+    timeout: Optional[int] = Field(default=30, description="Global timeout in seconds")
+    headless: Optional[bool] = Field(
+        default=True, description="Run browser in headless mode"
+    )
+    browser_type: Optional[str] = Field(
+        default="chromium", description="Browser to use: chromium, firefox, or webkit"
+    )
+
+
+class ExtractResponse(BaseModel):
+    """Response model for data extraction"""
+
+    status: str
+    message: str
+    data: Optional[Union[Dict, List, str]] = None
+    screenshot_path: Optional[str] = None
+
+
+# ================ Core Browser Action Handler ================
+
+
 class BrowserAction:
+    """Handles browser actions and commands"""
+
     def __init__(self, page, timeout: int = 30):
         self.page = page
         self.timeout = timeout
@@ -362,12 +424,17 @@ class BrowserAction:
         return result
 
 
+# ================ Helper Functions ================
+
+
 def get_browser_commands(user_input: str, page_structure=None) -> List[Dict]:
     """Convert natural language to structured browser commands using LLM"""
     logger.info(f"Generating browser commands for input: {user_input}")
 
     try:
-        system_content = system_prompt
+        # Define system prompt directly as a string
+        from prompts.system_prompt import system_prompt as prompt_text
+        system_content = prompt_text  # Use a different variable name to avoid confusion
         user_content = user_input
 
         if page_structure:
@@ -406,158 +473,7 @@ IMPORTANT: Only use selectors that exist in the page structure for interaction c
         raise Exception(f"Failed to generate browser commands: {str(e)}")
 
 
-async def execute_browser_interaction(
-    request: InteractionRequest,
-) -> InteractionResponse:
-    """Execute browser interactions based on natural language commands"""
-    logger.info(f"Processing interaction request: {request.user_input}")
-    command_results = []
-    screenshot_path = None
-    page_structure = None
-
-    try:
-        async with async_playwright() as p:
-            browser_types = {
-                "chromium": p.chromium,
-                "firefox": p.firefox,
-                "webkit": p.webkit,
-            }
-
-            browser_type = request.browser_type.lower()
-            if browser_type not in browser_types:
-                browser_type = "chromium"
-
-            browser = await browser_types[browser_type].launch(
-                headless=request.headless
-            )
-            page = await browser.new_page()
-
-            action_executor = BrowserAction(page, timeout=request.timeout)
-
-            initial_commands = get_browser_commands(request.user_input)
-
-            initial_nav_commands = [
-                cmd for cmd in initial_commands if cmd.get("command_type") == "navigate"
-            ]
-
-            if initial_nav_commands:
-                first_nav = initial_nav_commands[0]
-                nav_result = await action_executor.execute(first_nav)
-                command_results.append(nav_result)
-
-                if nav_result["success"]:
-                    from utils.browser_utils import extract_page_structure
-
-                    page_structure = await extract_page_structure(page)
-                    logger.info(
-                        f"Extracted page structure with {len(page_structure.get('interactiveElements', {}).get('inputs', []))} inputs, "
-                        + f"{len(page_structure.get('interactiveElements', {}).get('buttons', []))} buttons, "
-                        + f"{len(page_structure.get('interactiveElements', {}).get('links', []))} links"
-                    )
-
-                    commands = get_browser_commands(request.user_input, page_structure)
-
-                    commands = [
-                        cmd
-                        for cmd in commands
-                        if not (
-                            cmd.get("command_type") == "navigate"
-                            and cmd.get("url") == first_nav.get("url")
-                        )
-                    ]
-                else:
-                    commands = [cmd for cmd in initial_commands if cmd != first_nav]
-            else:
-                commands = initial_commands
-
-            for command in commands:
-                if command["command_type"] == "navigate" and any(
-                    r.get("command") == "navigate" for r in command_results
-                ):
-                    continue
-
-                result = await action_executor.execute(command)
-                command_results.append(result)
-
-                if (
-                    command["command_type"] == "navigate"
-                    and result["success"]
-                    and not page_structure
-                ):
-                    from utils.browser_utils import extract_page_structure
-
-                    page_structure = await extract_page_structure(page)
-                    logger.info("Extracted page structure after navigation")
-
-                if not result["success"] and command["command_type"] not in [
-                    "wait",
-                    "screenshot",
-                ]:
-                    logger.warning(f"Command failed: {result['message']}")
-
-                if result.get("screenshot_path"):
-                    screenshot_path = result["screenshot_path"]
-
-            if not screenshot_path:
-                filename = f"final_screenshot_{int(time.time())}.png"
-                path = f"/tmp/{filename}"
-                await page.screenshot(path=path)
-                screenshot_path = path
-
-            await browser.close()
-
-        success_count = sum(1 for result in command_results if result["success"])
-        status = "success" if success_count == len(command_results) else "partial"
-        if success_count == 0:
-            status = "error"
-
-        return InteractionResponse(
-            status=status,
-            message=f"Executed {success_count}/{len(command_results)} commands successfully",
-            details={"results": command_results},
-            screenshot_path=screenshot_path,
-        )
-
-    except Exception as e:
-        logger.error(f"Error in browser interaction: {str(e)}")
-        return InteractionResponse(
-            status="error",
-            message=f"Error during browser interaction: {str(e)}",
-            details={"error": str(e)},
-        )
-
-
-class ExtractRequest(BaseModel):
-    url: str
-    extraction_type: str = Field(
-        ...,
-        description="Type of extraction: 'text', 'links', 'table', 'elements', 'json'",
-    )
-    selector: Optional[str] = Field(
-        default=None, description="CSS selector to target specific elements"
-    )
-    attributes: Optional[List[str]] = Field(
-        default=None, description="Attributes to extract from elements"
-    )
-    timeout: Optional[int] = Field(default=30, description="Global timeout in seconds")
-    headless: Optional[bool] = Field(
-        default=True, description="Run browser in headless mode"
-    )
-    browser_type: Optional[str] = Field(
-        default="chromium", description="Browser to use: chromium, firefox, or webkit"
-    )
-
-
-class ExtractResponse(BaseModel):
-    status: str
-    message: str
-    data: Optional[Union[Dict, List, str]] = None
-    screenshot_path: Optional[str] = None
-
-
-async def execute_data_extraction(
-    request: ExtractRequest,
-) -> ExtractResponse:
+async def execute_data_extraction(request: ExtractRequest) -> ExtractResponse:
     """Execute data extraction from a webpage"""
     logger.info(f"Processing extraction request for URL: {request.url}")
 
@@ -633,192 +549,112 @@ async def execute_data_extraction(
         )
 
 
-@router.post("/extract", response_model=ExtractResponse)
-async def extract(request: ExtractRequest):
+# ================ Session API Routes ================
+
+
+@router.post("/session/start", response_model=SessionResponse)
+async def start_session(request: BrowserRequest):
     """
-    API endpoint to extract data from web pages
+    Start a new browser automation session.
 
-    Example input for extracting links:
-    {
-        "url": "https://example.com",
-        "extraction_type": "links",
-        "selector": "a.product-link",
-        "timeout": 30,
-        "headless": true
-    }
-
-    Example input for extracting table data:
-    {
-        "url": "https://example.com/table-page",
-        "extraction_type": "table",
-        "selector": "table.data-table",
-        "timeout": 30
-    }
-
-    Example input for extracting specific elements:
-    {
-        "url": "https://example.com/products",
-        "extraction_type": "elements",
-        "selector": ".product-card",
-        "attributes": ["innerText", "data-product-id", "data-price"],
-        "timeout": 30
-    }
+    Creates a persistent browser instance that can receive multiple commands
+    over time using the same session ID.
     """
     try:
         logger.info(
-            f"Received extraction request for URL: {request.url}, type: {request.extraction_type}"
+            f"Starting new browser session with type={request.browser_type}, headless={request.headless}"
         )
 
-        response = await execute_data_extraction(request)
+        session_id = await session_manager.create_session(
+            browser_type=request.browser_type,
+            headless=request.headless,
+            timeout=request.timeout,
+        )
 
-        return response
+        # Take initial screenshot
+        session = await session_manager.get_session(session_id)
+        screenshot_path = await session.take_screenshot()
+
+        return SessionResponse(
+            session_id=session_id,
+            status="success",
+            message="Browser session started successfully",
+            screenshot_path=screenshot_path,
+        )
 
     except Exception as e:
-        logger.error(f"Error in extraction API: {str(e)}")
+        logger.error(f"Error starting session: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/interact", response_model=InteractionResponse)
-async def interact(request: InteractionRequest, background_tasks: BackgroundTasks):
+@router.post("/session/{session_id}/stop", response_model=SessionResponse)
+async def stop_session(session_id: str):
     """
-    API endpoint to handle natural language browser interactions
-
-    Example input:
-    {
-        "user_input": "Log into Twitter using my account example@gmail.com with password mysecretpass123",
-        "timeout": 45,
-        "headless": false,
-        "browser_type": "chromium"
-    }
+    Stop a browser automation session and release all resources.
     """
     try:
-        logger.info(
-            f"Received interaction request with parameters: timeout={request.timeout}s, headless={request.headless}"
-        )
+        logger.info(f"Stopping browser session {session_id}")
 
-        response = await execute_browser_interaction(request)
-
-        return response
-
-    except Exception as e:
-        logger.error(f"Error in interaction API: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/browser/open", response_model=Dict)
-async def open_browser(request: InteractionRequest):
-    """
-    Open a browser instance for later interactions.
-    Returns a browser_id that can be used with other endpoints.
-    """
-    try:
-        logger.info(
-            f"Opening browser with type={request.browser_type}, headless={request.headless}"
-        )
-
-        browser_id = str(uuid.uuid4())
-
-        async with async_playwright() as p:
-            browser_types = {
-                "chromium": p.chromium,
-                "firefox": p.firefox,
-                "webkit": p.webkit,
-            }
-
-            browser_type = request.browser_type.lower()
-            if browser_type not in browser_types:
-                browser_type = "chromium"
-
-            # Store playwright instance and browser in global state
-            browser = await browser_types[browser_type].launch(
-                headless=request.headless
-            )
-            page = await browser.new_page()
-
-            # Take a screenshot to confirm it's working
-            filename = f"browser_open_{browser_id}_{int(time.time())}.png"
-            path = f"/tmp/{filename}"
-            await page.screenshot(path=path)
-
-            # Store browser session details in application state
-            from utils.browser_session import session_manager
-
-            session_id = await session_manager.create_session(
-                browser_type=request.browser_type,
-                headless=request.headless,
-                timeout=request.timeout,
-            )
-
-            return {
-                "status": "success",
-                "message": "Browser opened successfully",
-                "browser_id": session_id,
-                "screenshot_path": path,
-            }
-
-    except Exception as e:
-        logger.error(f"Error opening browser: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/browser/{browser_id}/close", response_model=Dict)
-async def close_browser(browser_id: str):
-    """
-    Close a previously opened browser instance.
-    """
-    try:
-        logger.info(f"Closing browser {browser_id}")
-
-        # Get browser session from manager
-        from utils.browser_session import session_manager
-
-        result = await session_manager.stop_session(browser_id)
+        result = await session_manager.stop_session(session_id)
 
         if result:
-            return {
-                "status": "success",
-                "message": "Browser closed successfully",
-                "browser_id": browser_id,
-            }
+            return SessionResponse(
+                session_id=session_id,
+                status="success",
+                message="Browser session stopped successfully",
+            )
         else:
             raise HTTPException(
                 status_code=404,
-                detail=f"Browser with ID {browser_id} not found or already closed",
+                detail=f"Session {session_id} not found or already stopped",
             )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error closing browser: {str(e)}")
+        logger.error(f"Error stopping session: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/browser/{browser_id}/execute", response_model=InteractionResponse)
-async def execute_with_browser(browser_id: str, request: InteractionRequest):
+@router.post("/session/{session_id}/execute", response_model=CommandResponse)
+async def execute_command(session_id: str, request: CommandRequest):
     """
-    Execute actions using a previously opened browser.
+    Execute a command in the browser session.
+
+    Examples:
+    - "Go to amazon.com and search for laptops"
+    - "Fill in the login form with username 'test' and password 'test123'"
+    - "Click on the first search result"
     """
     try:
         logger.info(
-            f"Executing commands in browser {browser_id}: {request.user_input[:50]}..."
+            f"Executing command in session {session_id}: {request.user_input[:50]}..."
         )
 
-        # Get browser session from manager
-        from utils.browser_session import session_manager
-
-        session = await session_manager.get_session(browser_id)
-
+        # Get the session
+        session = await session_manager.get_session(session_id)
         if not session or not session.is_active:
             raise HTTPException(
-                status_code=404,
-                detail=f"Browser with ID {browser_id} not found or not active",
+                status_code=404, detail=f"Session {session_id} not found or not active"
             )
 
+        # Get the page
         page = await session.get_page()
+        if not page:
+            raise HTTPException(status_code=400, detail="Browser page is not available")
+
+        # Create a BrowserAction instance for this page
         action_executor = BrowserAction(page, timeout=session.timeout)
 
-        # Generate commands from user input
-        commands = get_browser_commands(request.user_input)
+        # Generate commands from the user input
+        current_url = await page.url()
+        if current_url and current_url != "about:blank":
+            # Extract page structure to give context to the LLM
+            page_structure = await extract_page_structure(page)
+            commands = get_browser_commands(request.user_input, page_structure)
+        else:
+            commands = get_browser_commands(request.user_input)
+
         command_results = []
 
         # Execute each command
@@ -826,10 +662,16 @@ async def execute_with_browser(browser_id: str, request: InteractionRequest):
             result = await action_executor.execute(command)
             command_results.append(result)
 
-            # Update last activity
+            # Update last activity time
             session.last_activity = time.time()
 
-        # Take a screenshot
+            # If it was a navigation command, extract page structure for subsequent commands
+            if command["command_type"] == "navigate" and result["success"]:
+                # We could extract page structure here and update commands, but for
+                # simplicity we'll keep the flow linear
+                pass
+
+        # Take a screenshot after execution
         screenshot_path = await session.take_screenshot()
 
         # Calculate success rate
@@ -838,7 +680,7 @@ async def execute_with_browser(browser_id: str, request: InteractionRequest):
         if success_count == 0:
             status = "error"
 
-        return InteractionResponse(
+        return CommandResponse(
             status=status,
             message=f"Executed {success_count}/{len(command_results)} commands successfully",
             details={"results": command_results},
@@ -848,9 +690,160 @@ async def execute_with_browser(browser_id: str, request: InteractionRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error executing with browser: {str(e)}")
-        return InteractionResponse(
-            status="error",
-            message=f"Error during browser interaction: {str(e)}",
-            details={"error": str(e)},
+        logger.error(f"Error executing command: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/session/{session_id}/status", response_model=Dict)
+async def get_session_status(session_id: str):
+    """
+    Get the current status of a browser session.
+    """
+    try:
+        logger.info(f"Getting status for session {session_id}")
+
+        status = await session_manager.get_session_status(session_id)
+
+        if "error" in status.get("status", ""):
+            raise HTTPException(
+                status_code=404,
+                detail=status.get("message", f"Session {session_id} not found"),
+            )
+
+        return status
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/session/{session_id}/screenshot", response_model=Dict)
+async def take_screenshot(session_id: str):
+    """
+    Take a screenshot of the current browser state.
+    """
+    try:
+        logger.info(f"Taking screenshot for session {session_id}")
+
+        session = await session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(
+                status_code=404, detail=f"Session {session_id} not found"
+            )
+
+        screenshot_path = await session.take_screenshot()
+
+        return {
+            "status": "success",
+            "message": "Screenshot taken successfully",
+            "screenshot_path": screenshot_path,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error taking screenshot: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ================ One-off API Routes ================
+
+
+@router.post("/extract", response_model=ExtractResponse)
+async def extract(request: ExtractRequest):
+    """
+    Extract data from a webpage without creating a persistent session.
+
+    Examples:
+    - Extract links: {"url": "https://example.com", "extraction_type": "links", "selector": "a.product-link"}
+    - Extract table: {"url": "https://example.com/table", "extraction_type": "table", "selector": "table.data-table"}
+    - Extract elements: {"url": "https://example.com/products", "extraction_type": "elements", "selector": ".product", "attributes": ["innerText", "data-id"]}
+    """
+    try:
+        logger.info(
+            f"Received extraction request for URL: {request.url}, type: {request.extraction_type}"
         )
+        response = await execute_data_extraction(request)
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in extraction API: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/execute", response_model=CommandResponse)
+async def execute_one_off(
+    request: CommandRequest, browser_config: BrowserRequest = None
+):
+    """
+    Execute a one-off browser automation task without creating a persistent session.
+
+    This is useful for simple, one-time tasks that don't require maintaining state.
+
+    Examples:
+    - "Go to amazon.com and take a screenshot of the homepage"
+    - "Search for 'Python tutorial' on google and extract the first 5 results"
+    """
+    if browser_config is None:
+        browser_config = BrowserRequest()
+
+    try:
+        logger.info(f"Processing one-off execution request: {request.user_input}")
+        command_results = []
+        screenshot_path = None
+        page_structure = None
+
+        async with async_playwright() as p:
+            browser_types = {
+                "chromium": p.chromium,
+                "firefox": p.firefox,
+                "webkit": p.webkit,
+            }
+
+            browser_type = browser_config.browser_type.lower()
+            if browser_type not in browser_types:
+                browser_type = "chromium"
+
+            browser = await browser_types[browser_type].launch(
+                headless=browser_config.headless
+            )
+            page = await browser.new_page()
+
+            action_executor = BrowserAction(page, timeout=browser_config.timeout)
+
+            commands = get_browser_commands(request.user_input)
+
+            for command in commands:
+                result = await action_executor.execute(command)
+                command_results.append(result)
+
+                if command["command_type"] == "navigate" and result["success"]:
+                    page_structure = await extract_page_structure(page)
+                    # We could regenerate commands here based on page structure,
+                    # but for simplicity we'll keep the flow linear
+
+            # Take a final screenshot
+            filename = f"final_screenshot_{int(time.time())}.png"
+            path = f"/tmp/{filename}"
+            await page.screenshot(path=path)
+            screenshot_path = path
+
+            await browser.close()
+
+        success_count = sum(1 for result in command_results if result["success"])
+        status = "success" if success_count == len(command_results) else "partial"
+        if success_count == 0:
+            status = "error"
+
+        return CommandResponse(
+            status=status,
+            message=f"Executed {success_count}/{len(command_results)} commands successfully",
+            details={"results": command_results},
+            screenshot_path=screenshot_path,
+        )
+
+    except Exception as e:
+        logger.error(f"Error in one-off execution: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))

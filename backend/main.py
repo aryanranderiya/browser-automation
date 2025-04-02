@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routes.interact import router as interact_router
-from routes.automate import router as automate_router
+from routes.routes import router as routes_router
 from utils.logger import setup_logger
 
 # Set up application-wide logger
@@ -15,8 +14,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.include_router(interact_router)
-app.include_router(automate_router)
+app.include_router(routes_router)
 
 
 @app.get("/")
