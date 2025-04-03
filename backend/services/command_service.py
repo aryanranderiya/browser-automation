@@ -18,8 +18,9 @@ client = OpenAI(
 def get_browser_commands(
     user_input: str, page_structure=None, previous_commands=None
 ) -> List[Dict]:
-    """Convert natural language to a SINGLE structured browser command using LLM"""
-    logger.info(f"Generating browser command for input: {user_input}")
+    """Convert natural language to structured browser commands using LLM.
+    Can return multiple commands when they're related and on the same page."""
+    logger.info(f"Generating browser commands for input: {user_input}")
 
     try:
         system_content = system_prompt
@@ -93,7 +94,7 @@ def get_browser_commands(
 
 For the task: {user_input}
 
-First navigate to an appropriate website. Return ONLY the NEXT SINGLE command to execute."""
+First navigate to an appropriate website. Return ONLY a navigation command."""
 
         elif page_structure:
             # Clean up page structure to focus on the most useful parts
@@ -113,17 +114,17 @@ First navigate to an appropriate website. Return ONLY the NEXT SINGLE command to
 
 TASK: {user_input}
 
-Based on the current page state and previous actions, determine the NEXT SINGLE command to execute.
+Based on the current page state and previous actions, determine the commands to execute.
 IMPORTANT: 
-1. Return ONLY the NEXT SINGLE command to execute 
+1. You can group MULTIPLE RELATED COMMANDS when they operate on the same page (especially form filling)
 2. Only use selectors that exist in the page structure
 3. Consider what has been done already before deciding the next action
-4. Focus on making progress toward completing the user's task"""
+4. GROUP FORM FILLING operations into a single response with multiple commands"""
 
         # Add previous command context to the user content
         if task_progress_context:
             user_content += f"\n\nCHRONOLOGICAL HISTORY OF PREVIOUS ACTIONS:\n{task_progress_context}"
-            user_content += "\nBased on the above history and current page state, determine the next logical step."
+            user_content += "\nBased on the above history and current page state, determine the next logical step(s)."
 
         # Check if we need to determine task completion
         is_task_completion_check = False
@@ -151,54 +152,67 @@ IMPORTANT:
             logger.warning("No commands generated from user input")
             return []
 
-        # We're only interested in the first command
-        if len(commands) > 1:
-            logger.info("Multiple commands received, using only the first one")
+        # For blank pages, enforce that the command must be navigation and there's only one command
+        if is_blank_page:
+            if not commands or commands[0].get("command_type") != "navigate":
+                # If no navigation command was provided, provide a default one
+                logger.warning(
+                    "No navigation command provided for blank page, adding default navigation"
+                )
+                commands = [
+                    {
+                        "command_type": "navigate",
+                        "url": "https://www.google.com",
+                    }
+                ]
+            # For blank pages, only allow the first command and it must be navigation
             commands = [commands[0]]
 
-        # For blank pages, enforce that the command must be navigation
-        if is_blank_page and commands[0].get("command_type") != "navigate":
-            # If no navigation command was provided, provide a default one
-            logger.warning(
-                "No navigation command provided for blank page, adding default navigation"
-            )
-            default_navigation = {
-                "command_type": "navigate",
-                "url": "https://www.google.com",
-            }
-            commands = [default_navigation]
-
-        # Process the single command to ensure wait_for_page_load after navigation
+        # Process commands to add wait_for_page_load after navigation
         processed_commands = []
-        cmd = commands[0]
-        processed_commands.append(cmd)
+        for i, cmd in enumerate(commands):
+            processed_commands.append(cmd)
 
-        # If this is a navigation command, insert a wait_for_page_load command after it
-        if cmd.get("command_type") == "navigate":
-            wait_command = {
-                "command_type": "wait_for_page_load",
-                "timeout": 10000,  # 10 seconds timeout
-            }
-            processed_commands.append(wait_command)
-            logger.info(
-                f"Added wait_for_page_load command after navigation to {cmd.get('url')}"
-            )
+            # If this is a navigation command, insert a wait_for_page_load command after it
+            if cmd.get("command_type") == "navigate":
+                wait_command = {
+                    "command_type": "wait_for_page_load",
+                    "timeout": 10000,  # 10 seconds timeout
+                }
+                processed_commands.append(wait_command)
+                logger.info(
+                    f"Added wait_for_page_load command after navigation to {cmd.get('url')}"
+                )
 
-        logger.info(f"Generated command: {processed_commands}")
+                # If there are more commands after a navigation, remove them
+                # (we should only execute commands after we've confirmed the page loaded)
+                if i < len(commands) - 1:
+                    logger.warning(
+                        "Removing commands after navigation as they should be executed in the next iteration"
+                    )
+                    break
+
+        logger.info(f"Generated {len(processed_commands)} commands")
 
         # Check for task completion signal
         task_completed = False
         task_summary = ""
 
-        # Check if command indicates task completion
-        if "task_completed" in cmd and cmd["task_completed"]:
-            logger.info("LLM indicated task is complete!")
-            task_completed = True
-            if "task_summary" in cmd:
-                task_summary = cmd["task_summary"]
+        # Check if any command indicates task completion
+        for cmd in commands:
+            if "task_completed" in cmd and cmd["task_completed"]:
+                logger.info("LLM indicated task is complete!")
+                task_completed = True
+                if "task_summary" in cmd:
+                    task_summary = cmd["task_summary"]
+                break
 
         # Alternative check if task_completed is in the top-level response
-        elif "task_completed" in parsed_response and parsed_response["task_completed"]:
+        if (
+            not task_completed
+            and "task_completed" in parsed_response
+            and parsed_response["task_completed"]
+        ):
             logger.info("LLM indicated task is complete in top-level response!")
             task_completed = True
             if "task_summary" in parsed_response:
@@ -213,11 +227,11 @@ IMPORTANT:
                     }
                 ]
 
-        # Add task completion and summary to the first command
+        # Add task completion and summary to the last command if task is completed
         if processed_commands and task_completed:
-            processed_commands[0]["task_completed"] = True
+            processed_commands[-1]["task_completed"] = True
             if task_summary:
-                processed_commands[0]["task_summary"] = task_summary
+                processed_commands[-1]["task_summary"] = task_summary
 
         return processed_commands
 

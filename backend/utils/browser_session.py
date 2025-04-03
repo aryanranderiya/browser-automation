@@ -196,9 +196,9 @@ class BrowserSession:
                 if current_url and not current_url.startswith("about:"):
                     # Parse the current page to understand its structure
                     page_structure = await extract_page_structure(self.page)
-                    self.logger.info(f"Extracted page structure from {current_url=} {page_structure=}")
+                    self.logger.info(f"Extracted page structure from {current_url}")
 
-                # Get the next single command from LLM based on current page state and previous actions
+                # Get commands from LLM based on current page state and previous actions
                 browser_commands = get_browser_commands(
                     original_input,
                     page_structure,
@@ -225,13 +225,17 @@ class BrowserSession:
                     )
                     break
 
-                # Check for task_completed flag in first command
-                if browser_commands[0].get("task_completed", False):
-                    task_completed = True
-                    final_explanation = browser_commands[0].get(
-                        "task_summary", "Task completed successfully"
-                    )
-                    self.logger.info(f"Task completion flag found: {final_explanation}")
+                # Check for task_completed flag in any command
+                for cmd in browser_commands:
+                    if cmd.get("task_completed", False):
+                        task_completed = True
+                        final_explanation = cmd.get(
+                            "task_summary", "Task completed successfully"
+                        )
+                        self.logger.info(
+                            f"Task completion flag found: {final_explanation}"
+                        )
+                        break
 
                 # Create an instance of BrowserAction to handle command execution
                 action_executor = BrowserAction(self.page, timeout=self.timeout)
@@ -311,7 +315,7 @@ class BrowserSession:
                     iteration_results.append(result)
                     command_chain_results.append(result)
 
-                    # If this action failed and it's critical (like navigation), stop processing this iteration
+                    # If this action failed and it's a critical action, stop processing this iteration
                     if not result["success"] and action in [
                         "navigate",
                         "click",
@@ -331,11 +335,20 @@ class BrowserSession:
                         )
                         break
 
+                    # After navigation, we should stop and re-evaluate the new page
+                    if action == "navigate" and result["success"]:
+                        self.logger.info(
+                            "Stopping after navigation to evaluate new page in next iteration"
+                        )
+                        break
+
                 # Take a screenshot after each iteration's command execution
                 screenshot_path = await self.take_screenshot()
 
                 # Short delay between iterations to prevent overloading the browser
-                await asyncio.sleep(1)
+                await asyncio.sleep(
+                    0.5
+                )  # Reduced from 1 second to 0.5 seconds for faster execution
 
                 # Generate an interim explanation for this iteration
                 if (

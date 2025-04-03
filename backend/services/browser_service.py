@@ -23,7 +23,7 @@ class BrowserAction:
         """Execute a browser command and return result with status"""
         action = command.get("command_type")
         result = {"success": False, "message": "", "command": action}
-        time.sleep(3)
+        # time.sleep(3)
         try:
             if action == "navigate":
                 url = command.get("url", "")
@@ -378,14 +378,8 @@ class BrowserAction:
                                 text = await element.text_content() or ""
                                 data[attr] = text.strip()
                             elif attr == "innerHTML":
-                                # For innerHTML, we still need to use evaluate but on a single element
-                                handle = await element.element_handle()
-                                data[attr] = await self.page.evaluate(
-                                    "el => el.innerHTML", handle
-                                )
-                                await handle.dispose()  # Clean up the handle
+                                data[attr] = await element.inner_html()
                             else:
-                                # For other attributes, use get_attribute
                                 value = await element.get_attribute(attr) or ""
                                 data[attr] = value
 

@@ -106,10 +106,7 @@ async def extract_page_structure(page):
     """
     Extracts the structure of the current page including important interactive elements.
     This helps the LLM understand what elements are actually available for interaction.
-
-    Note: We use a hybrid approach here - using locators for basic page details
-    and a more focused evaluate call for the complex extraction of interactive elements
-    and page structure.
+    Uses Playwright's Locator API instead of evaluate for better maintainability.
     """
     # Extract basic page info using locators
     url = page.url
@@ -134,263 +131,353 @@ async def extract_page_structure(page):
         > 0
     )
 
-    # Use evaluate call for the complex element extraction since it's more efficient than
-    # multiple locator calls for this specific case
-    # This is more focused than before, only extracting interactive elements
-    page_details = await page.evaluate("""() => {
-        // Helper function to get a simplified DOM path
-        function getElementPath(element, maxLength = 80) {
-            let path = '';
-            const idPath = [];
-            const classPath = [];
-            
-            // Try to create a reasonable path with id/class info
-            while (element && element.nodeType === Node.ELEMENT_NODE) {
-                let identifier = element.tagName.toLowerCase();
-                
-                if (element.id) {
-                    identifier += '#' + element.id;
-                    idPath.unshift(identifier);
-                } else if (element.className && typeof element.className === 'string') {
-                    const classes = element.className.split(/\\s+/).filter(Boolean).join('.');
-                    if (classes) {
-                        identifier += '.' + classes;
-                    }
-                    classPath.unshift(identifier);
-                } else {
-                    // Count sibling position for elements without ID or class
-                    let sibling = element, position = 1;
-                    while (sibling = sibling.previousElementSibling) {
-                        if (sibling.tagName === element.tagName) position++;
-                    }
-                    
-                    if (position > 1) {
-                        identifier += `:nth-of-type(${position})`;
-                    }
-                    classPath.unshift(identifier);
-                }
-                
-                element = element.parentElement;
-            }
-            
-            // Prefer ID-based paths, then class-based
-            path = idPath.length > 0 ? idPath.join(' > ') : classPath.join(' > ');
-            
-            // Truncate if too long
-            if (path.length > maxLength) {
-                path = '...' + path.substring(path.length - maxLength);
-            }
-            
-            return path;
-        }
-        
-        // Helper function to generate a CSS selector for an element
-        function getCssSelector(element) {
-            if (!element) return null;
-            
-            // If element has an ID, that's the simplest selector
-            if (element.id) {
-                return `#${element.id}`;
-            }
-            
-            // If element has a name attribute (common for form elements)
-            if (element.name && (element.tagName === 'INPUT' || element.tagName === 'SELECT' || element.tagName === 'TEXTAREA')) {
-                return `${element.tagName.toLowerCase()}[name="${element.name}"]`;
-            }
-            
-            // For buttons and links, try to use text content
-            if ((element.tagName === 'BUTTON' || element.tagName === 'A') && element.textContent.trim()) {
-                const trimmedText = element.textContent.trim().substring(0, 30).replace(/"/g, '\\"');
-                return `${element.tagName.toLowerCase()}:contains("${trimmedText}")`;
-            }
-            
-            // If element has distinguishing classes
-            if (element.className && typeof element.className === 'string') {
-                const classes = element.className.split(/\\s+/).filter(Boolean);
-                if (classes.length > 0) {
-                    // Use the most specific class that would likely identify the element
-                    let bestClass = classes.find(cls => cls.match(/^(btn|button|submit|search|input|field|form|menu|nav|link|item|card|container)/) || 
-                                                        cls.match(/[A-Z]/) || // Component-style class names often have capitals
-                                                        cls.length > 8); // Longer class names tend to be more specific
-                    
-                    if (!bestClass) bestClass = classes[0]; // Fallback to first class
-                    return `${element.tagName.toLowerCase()}.${bestClass}`;
-                }
-            }
-            
-            // Fallback to a position-based selector
-            let parent = element.parentElement;
-            if (parent) {
-                let siblings = Array.from(parent.children).filter(child => child.tagName === element.tagName);
-                if (siblings.length > 1) {
-                    const index = siblings.indexOf(element) + 1;
-                    return `${element.tagName.toLowerCase()}:nth-of-type(${index})`;
-                } else {
-                    return element.tagName.toLowerCase();
-                }
-            }
-            
-            // Last resort
-            return element.tagName.toLowerCase();
-        }
-        
-        // Helper: Check if element is visible on page
-        function isElementVisible(el) {
-            if (!el) return false;
-            if (el.style.display === 'none') return false;
-            if (el.style.visibility === 'hidden') return false;
-            if (el.style.opacity === '0') return false;
-            
-            const style = window.getComputedStyle(el);
-            if (style.display === 'none') return false;
-            if (style.visibility === 'hidden') return false;
-            if (parseFloat(style.opacity) === 0) return false;
-            
-            const rect = el.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) return false;
-            
-            return true;
-        }
-
-        // Extract interactive elements only - more focused approach
-        const interactiveElements = {
-            inputs: [],
-            buttons: [],
-            links: [],
-            selects: [],
-            forms: [],
-            checkboxes: []
-        };
-        
-        // Extract inputs
-        document.querySelectorAll('input:not([type="hidden"]):not([disabled]), textarea:not([disabled])').forEach(el => {
-            if (!isElementVisible(el)) return;
-            
-            const visibleText = el.labels ? Array.from(el.labels).map(label => label.textContent.trim()).join(' ') : '';
-            const placeholder = el.placeholder || '';
-            const selector = getCssSelector(el);
-            
-            interactiveElements.inputs.push({
-                type: el.type || 'text',
-                name: el.name || '',
-                id: el.id || '',
-                placeholder: placeholder,
-                labelText: visibleText,
-                selector: selector,
-                isRequired: el.required
-            });
-        });
-        
-        // Extract buttons
-        document.querySelectorAll('button:not([disabled]), [type="button"]:not([disabled]), [type="submit"]:not([disabled]), [role="button"]:not([disabled])').forEach(el => {
-            if (!isElementVisible(el)) return;
-            
-            const text = el.innerText.trim().substring(0, 50);
-            const selector = getCssSelector(el);
-            
-            interactiveElements.buttons.push({
-                text: text,
-                id: el.id || '',
-                selector: selector,
-                isSubmit: el.type === 'submit'
-            });
-        });
-        
-        // Extract links
-        document.querySelectorAll('a:not([disabled])').forEach(el => {
-            if (!isElementVisible(el)) return;
-            
-            const text = el.innerText.trim().substring(0, 50);
-            const selector = getCssSelector(el);
-            
-            interactiveElements.links.push({
-                text: text,
-                href: el.href || '',
-                selector: selector
-            });
-        });
-        
-        // Extract select elements
-        document.querySelectorAll('select:not([disabled])').forEach(el => {
-            if (!isElementVisible(el)) return;
-            
-            const selector = getCssSelector(el);
-            const labelText = el.labels ? Array.from(el.labels).map(label => label.textContent.trim()).join(' ') : '';
-            
-            interactiveElements.selects.push({
-                name: el.name || '',
-                id: el.id || '',
-                labelText: labelText,
-                options: Array.from(el.options).map(opt => ({
-                    text: opt.text,
-                    value: opt.value,
-                    selected: opt.selected
-                })).slice(0, 15), // Limit options for brevity
-                selector: selector
-            });
-        });
-        
-        // Extract form elements
-        document.querySelectorAll('form').forEach(el => {
-            const submitButton = el.querySelector('button[type="submit"], input[type="submit"]');
-            
-            interactiveElements.forms.push({
-                id: el.id || '',
-                action: el.action || '',
-                method: el.method || 'get',
-                selector: getCssSelector(el),
-                submitSelector: submitButton ? getCssSelector(submitButton) : null,
-                submitText: submitButton ? (submitButton.innerText.trim() || submitButton.value) : ''
-            });
-        });
-        
-        // Extract checkboxes and radio buttons
-        document.querySelectorAll('input[type="checkbox"]:not([disabled]), input[type="radio"]:not([disabled])').forEach(el => {
-            if (!isElementVisible(el)) return;
-            
-            const labelText = el.labels ? Array.from(el.labels).map(label => label.textContent.trim()).join(' ') : '';
-            const selector = getCssSelector(el);
-            
-            interactiveElements.checkboxes.push({
-                type: el.type,
-                name: el.name || '',
-                id: el.id || '',
-                labelText: labelText,
-                checked: el.checked,
-                selector: selector
-            });
-        });
-        
-        // Extract headings as they provide context
-        const headings = {
-            h1: Array.from(document.querySelectorAll('h1')).map(h => h.innerText.trim()).filter(Boolean),
-            h2: Array.from(document.querySelectorAll('h2')).slice(0, 5).map(h => h.innerText.trim()).filter(Boolean)
-        };
-        
-        // Extract main content text (truncated)
-        const mainContent = document.querySelector('main, [role="main"], #main, .main, #content, .content, article');
-        const mainText = mainContent 
-            ? mainContent.innerText.substring(0, 500) + (mainContent.innerText.length > 500 ? '...' : '')
-            : document.body.innerText.substring(0, 300) + (document.body.innerText.length > 300 ? '...' : '');
-            
-        return {
-            interactiveElements,
-            headings,
-            mainText
-        };
-    }""")
-
-    # Combine the data from locators and evaluate
-    return {
-        "title": title,
+    # Use Playwright's Locator API for all element extraction
+    result = {
         "url": url,
+        "title": title,
         "pageFeatures": {
             "hasCaptcha": has_captcha,
             "hasLoginForm": has_login_form,
             "hasNavigation": has_navigation,
             "hasSearchBox": has_search_box,
         },
-        "headings": page_details["headings"],
-        "mainText": page_details["mainText"],
-        "interactiveElements": page_details["interactiveElements"],
     }
+
+    # Extract headings (limit to 3 for h1, 5 for h2 to save tokens)
+    headings = {}
+    h1_locator = page.locator("h1")
+    h1_count = min(await h1_locator.count(), 3)
+    if h1_count > 0:
+        h1s = []
+        for i in range(h1_count):
+            text = await h1_locator.nth(i).text_content()
+            if text.strip():
+                h1s.append(text.strip())
+        if h1s:
+            headings["h1"] = h1s
+
+    h2_locator = page.locator("h2")
+    h2_count = min(await h2_locator.count(), 5)
+    if h2_count > 0:
+        h2s = []
+        for i in range(h2_count):
+            text = await h2_locator.nth(i).text_content()
+            if text.strip():
+                h2s.append(text.strip())
+        if h2s:
+            headings["h2"] = h2s
+
+    if headings:
+        result["headings"] = headings
+
+    # Extract main content text (truncated)
+    main_content_locator = page.locator(
+        'main, [role="main"], #main, .main, #content, .content, article'
+    ).first
+    if await main_content_locator.count() > 0:
+        main_text = await main_content_locator.text_content()
+        if main_text:
+            main_text = main_text.strip()[:300]  # Limit to 300 characters
+            result["mainText"] = main_text
+    else:
+        # If no main content element found, use body (with limited content)
+        body_text = await page.locator("body").text_content()
+        if body_text:
+            body_text = body_text.strip()[:200]  # Even more limited for body
+            result["mainText"] = body_text
+
+    # Extract interactive elements
+    interactive_elements = {}
+
+    # Extract inputs
+    inputs_locator = page.locator(
+        'input:not([type="hidden"]):not([disabled]), textarea:not([disabled])'
+    )
+    input_count = await inputs_locator.count()
+    if input_count > 0:
+        inputs = []
+        for i in range(input_count):
+            input_el = inputs_locator.nth(i)
+
+            # Skip if not visible (similar to isElementVisible in JS)
+            if not await input_el.is_visible():
+                continue
+
+            # Get basic properties
+            input_type = await input_el.get_attribute("type") or "text"
+            input_name = await input_el.get_attribute("name") or ""
+            input_id = await input_el.get_attribute("id") or ""
+            placeholder = await input_el.get_attribute("placeholder") or ""
+
+            # Check if required
+            is_required = await input_el.get_attribute("required") == "true"
+
+            # Get label text (more complex)
+            label_text = ""
+            if input_id:
+                label_locator = page.locator(f'label[for="{input_id}"]')
+                if await label_locator.count() > 0:
+                    label_text = await label_locator.text_content() or ""
+
+            # Create selector (with simplified logic)
+            selector = None
+            if input_id:
+                selector = f"#{input_id}"
+            elif input_name:
+                selector = f'input[name="{input_name}"]'
+            else:
+                selector = input_type
+
+            inputs.append(
+                {
+                    "type": input_type,
+                    "name": input_name,
+                    "id": input_id,
+                    "placeholder": placeholder,
+                    "labelText": label_text.strip(),
+                    "selector": selector,
+                    "isRequired": is_required,
+                }
+            )
+
+        if inputs:
+            interactive_elements["inputs"] = inputs
+
+    # Extract buttons
+    buttons_locator = page.locator(
+        'button:not([disabled]), [type="button"]:not([disabled]), [type="submit"]:not([disabled]), [role="button"]:not([disabled])'
+    )
+    button_count = await buttons_locator.count()
+    if button_count > 0:
+        buttons = []
+        for i in range(button_count):
+            button = buttons_locator.nth(i)
+
+            # Skip if not visible
+            if not await button.is_visible():
+                continue
+
+            button_text = await button.text_content() or ""
+            button_id = await button.get_attribute("id") or ""
+            button_type = await button.get_attribute("type") or ""
+
+            # Create selector
+            selector = None
+            if button_id:
+                selector = f"#{button_id}"
+            elif button_text.strip():
+                selector = f'button:has-text("{button_text.strip()[:30]}")'
+            else:
+                selector = "button"
+
+            buttons.append(
+                {
+                    "text": button_text.strip()[:50],
+                    "id": button_id,
+                    "selector": selector,
+                    "isSubmit": button_type == "submit",
+                }
+            )
+
+        if buttons:
+            interactive_elements["buttons"] = buttons
+
+    # Extract links
+    links_locator = page.locator("a:not([disabled])")
+    link_count = await links_locator.count()
+    if link_count > 0:
+        links = []
+        for i in range(link_count):
+            link = links_locator.nth(i)
+
+            # Skip if not visible
+            if not await link.is_visible():
+                continue
+
+            link_text = await link.text_content() or ""
+            if not link_text.strip():
+                continue  # Skip links without text
+
+            link_href = await link.get_attribute("href") or ""
+
+            links.append(
+                {
+                    "text": link_text.strip()[:50],
+                    "href": link_href,
+                    "selector": f'a:has-text("{link_text.strip()[:30]}")',
+                }
+            )
+
+        if links:
+            interactive_elements["links"] = links
+
+    # Extract select elements
+    selects_locator = page.locator("select:not([disabled])")
+    select_count = await selects_locator.count()
+    if select_count > 0:
+        selects = []
+        for i in range(select_count):
+            select = selects_locator.nth(i)
+
+            # Skip if not visible
+            if not await select.is_visible():
+                continue
+
+            select_name = await select.get_attribute("name") or ""
+            select_id = await select.get_attribute("id") or ""
+
+            # Get label text
+            label_text = ""
+            if select_id:
+                label_locator = page.locator(f'label[for="{select_id}"]')
+                if await label_locator.count() > 0:
+                    label_text = await label_locator.text_content() or ""
+
+            # Get options (limited to first 10)
+            options_locator = select.locator("option")
+            option_count = min(await options_locator.count(), 10)
+            options = []
+
+            for j in range(option_count):
+                option = options_locator.nth(j)
+                option_text = await option.text_content() or ""
+                option_value = await option.get_attribute("value") or ""
+                is_selected = await option.get_attribute("selected") is not None
+
+                options.append(
+                    {
+                        "text": option_text.strip(),
+                        "value": option_value,
+                        "selected": is_selected,
+                    }
+                )
+
+            # Create selector
+            selector = None
+            if select_id:
+                selector = f"#{select_id}"
+            elif select_name:
+                selector = f'select[name="{select_name}"]'
+            else:
+                selector = "select"
+
+            selects.append(
+                {
+                    "name": select_name,
+                    "id": select_id,
+                    "labelText": label_text.strip(),
+                    "options": options,
+                    "selector": selector,
+                }
+            )
+
+        if selects:
+            interactive_elements["selects"] = selects
+
+    # Extract form elements
+    forms_locator = page.locator("form")
+    form_count = await forms_locator.count()
+    if form_count > 0:
+        forms = []
+        for i in range(form_count):
+            form = forms_locator.nth(i)
+            form_id = await form.get_attribute("id") or ""
+            form_action = await form.get_attribute("action") or ""
+            form_method = await form.get_attribute("method") or "get"
+
+            # Find submit button
+            submit_button = form.locator(
+                'button[type="submit"], input[type="submit"]'
+            ).first
+            submit_selector = None
+            submit_text = ""
+
+            if await submit_button.count() > 0:
+                submit_id = await submit_button.get_attribute("id") or ""
+                submit_text = (
+                    await submit_button.text_content()
+                    or await submit_button.get_attribute("value")
+                    or ""
+                )
+
+                if submit_id:
+                    submit_selector = f"#{submit_id}"
+                elif submit_text.strip():
+                    submit_selector = f'button:has-text("{submit_text.strip()[:30]}")'
+                else:
+                    submit_selector = 'button[type="submit"], input[type="submit"]'
+
+            # Create selector
+            selector = None
+            if form_id:
+                selector = f"#{form_id}"
+            else:
+                selector = "form"
+
+            forms.append(
+                {
+                    "id": form_id,
+                    "action": form_action,
+                    "method": form_method,
+                    "selector": selector,
+                    "submitSelector": submit_selector,
+                    "submitText": submit_text.strip(),
+                }
+            )
+
+        if forms:
+            interactive_elements["forms"] = forms
+
+    # Extract checkboxes and radio buttons
+    checkboxes_locator = page.locator(
+        'input[type="checkbox"]:not([disabled]), input[type="radio"]:not([disabled])'
+    )
+    checkbox_count = await checkboxes_locator.count()
+    if checkbox_count > 0:
+        checkboxes = []
+        for i in range(checkbox_count):
+            checkbox = checkboxes_locator.nth(i)
+
+            # Skip if not visible
+            if not await checkbox.is_visible():
+                continue
+
+            checkbox_type = await checkbox.get_attribute("type") or ""
+            checkbox_name = await checkbox.get_attribute("name") or ""
+            checkbox_id = await checkbox.get_attribute("id") or ""
+            is_checked = await checkbox.is_checked()
+
+            # Get label text
+            label_text = ""
+            if checkbox_id:
+                label_locator = page.locator(f'label[for="{checkbox_id}"]')
+                if await label_locator.count() > 0:
+                    label_text = await label_locator.text_content() or ""
+
+            # Create selector
+            selector = None
+            if checkbox_id:
+                selector = f"#{checkbox_id}"
+            elif checkbox_name:
+                selector = f'input[name="{checkbox_name}"][type="{checkbox_type}"]'
+            else:
+                selector = f'input[type="{checkbox_type}"]'
+
+            checkboxes.append(
+                {
+                    "type": checkbox_type,
+                    "name": checkbox_name,
+                    "id": checkbox_id,
+                    "labelText": label_text.strip(),
+                    "checked": is_checked,
+                    "selector": selector,
+                }
+            )
+
+        if checkboxes:
+            interactive_elements["checkboxes"] = checkboxes
+
+    if interactive_elements:
+        result["interactiveElements"] = interactive_elements
+
+    return result
