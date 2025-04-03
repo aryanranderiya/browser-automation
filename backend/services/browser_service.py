@@ -1,4 +1,3 @@
-import time
 from typing import Dict
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -52,7 +51,7 @@ class BrowserAction:
                 current_url = self.page.url
                 if current_url == "about:blank" or not current_url:
                     # Instead of failing immediately, provide a more helpful response
-                    self.logger.warning(f"Cannot search on blank page.")
+                    self.logger.warning("Cannot search on blank page.")
                     result["success"] = False
                     result["message"] = (
                         "Cannot search on an empty page. A navigation command is required first."
@@ -198,9 +197,7 @@ class BrowserAction:
                 }
 
             elif action == "wait_for_page_load":
-                timeout = command.get(
-                    "timeout", 10000
-                )  # Default 10 seconds in milliseconds
+                timeout = command.get("timeout", 2)
                 self.logger.info(
                     f"Waiting for page to load completely, timeout: {timeout}ms"
                 )
@@ -393,7 +390,7 @@ class BrowserAction:
                                     "data": json.loads(json_ld_content),
                                 }
                                 result["success"] = True
-                                result["message"] = f"Extracted structured JSON-LD data"
+                                result["message"] = "Extracted structured JSON-LD data"
                                 result["data"] = json_data["data"]
                                 return result
                         except Exception as json_error:

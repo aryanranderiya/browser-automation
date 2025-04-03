@@ -9,6 +9,7 @@ from utils.browser_utils import extract_page_structure
 from services.command_service import get_browser_commands
 from services.browser_service import BrowserAction
 from dotenv import load_dotenv
+from playwright_stealth import stealth_async
 
 load_dotenv()
 logger = setup_logger("browser_session")
@@ -73,10 +74,83 @@ class BrowserSession:
         if self.browser_type.lower() not in browser_types:
             self.browser_type = "chromium"
 
+        # Configure browser with anti-detection settings
+        browser_options = {}
+        if self.browser_type.lower() == "chromium":
+            browser_options = {
+                "headless": self.headless,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-site-isolation-trials",
+                    "--disable-web-security",
+                    "--disable-setuid-sandbox",
+                    "--no-sandbox",
+                    "--disable-infobars",
+                    "--window-size=1920,1080",
+                    "--start-maximized",
+                ],
+            }
+        else:
+            browser_options = {"headless": self.headless}
+
         self.browser = await browser_types[self.browser_type.lower()].launch(
-            headless=self.headless
+            **browser_options
         )
-        self.page = await self.browser.new_page()
+
+        # Set up extra browser context with realistic viewport and user agent
+        context = await self.browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            locale="en-US",
+            timezone_id="America/New_York",
+            is_mobile=False,
+            has_touch=False,
+        )
+
+        self.page = await context.new_page()
+        # self.browser = await browser_types[self.browser_type.lower()].launch(
+        #     headless=self.headless
+        # )
+        # self.page = await self.browser.new_page()
+
+        # Apply stealth mode to make browser automation less detectable and avoid captchas
+        # self.logger.info("Applying stealth mode to browser to prevent captchas")
+        # await stealth_async(self.page)
+
+        # Additional anti-captcha measures - modify navigator object to hide automation flags
+        # await self.page.add_init_script("""
+        # Object.defineProperty(navigator, 'webdriver', {
+        #     get: () => false,
+        # });
+
+        # // Prevent captcha services from detecting headless browser
+        # if (navigator.plugins) {
+        #     Object.defineProperty(navigator, 'plugins', {
+        #         get: () => [
+        #             { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+        #             { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+        #             { name: 'Native Client', filename: 'internal-nacl-plugin' },
+        #         ],
+        #     });
+        # }
+
+        # // WebGL fingerprinting
+        # const getParameter = WebGLRenderingContext.prototype.getParameter;
+        # WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        #     if (parameter === 37445) {
+        #         return 'Intel Inc.';
+        #     }
+        #     if (parameter === 37446) {
+        #         return 'Intel Iris OpenGL Engine';
+        #     }
+        #     return getParameter.apply(this, arguments);
+        # };
+        # """)
+
+        # Accept all cookies by default - helps with cookie notices
+        await self.page.route("**/*", lambda route: route.continue_())
+
         self.is_active = True
         self.last_activity = time.time()
 

@@ -208,6 +208,7 @@ async def extract_page_structure(page):
             input_name = await input_el.get_attribute("name") or ""
             input_id = await input_el.get_attribute("id") or ""
             placeholder = await input_el.get_attribute("placeholder") or ""
+            class_attr = await input_el.get_attribute("class") or ""
 
             # Check if required
             is_required = await input_el.get_attribute("required") == "true"
@@ -223,10 +224,14 @@ async def extract_page_structure(page):
             selector = None
             if input_id:
                 selector = f"#{input_id}"
+            elif class_attr:
+                class_names = class_attr.split()
+                if class_names:
+                    selector = f"input.{class_names[0]}"
             elif input_name:
                 selector = f'input[name="{input_name}"]'
             else:
-                selector = input_type
+                selector = f'input[type="{input_type}"]'
 
             inputs.append(
                 {
@@ -234,6 +239,7 @@ async def extract_page_structure(page):
                     "name": input_name,
                     "id": input_id,
                     "placeholder": placeholder,
+                    "classes": class_attr,
                     "labelText": label_text.strip(),
                     "selector": selector,
                     "isRequired": is_required,
@@ -260,11 +266,20 @@ async def extract_page_structure(page):
             button_text = await button.text_content() or ""
             button_id = await button.get_attribute("id") or ""
             button_type = await button.get_attribute("type") or ""
+            class_attr = await button.get_attribute("class") or ""
+            data_testid = await button.get_attribute("data-testid") or ""
 
             # Create selector
             selector = None
             if button_id:
                 selector = f"#{button_id}"
+            elif data_testid:
+                selector = f'[data-testid="{data_testid}"]'
+            elif class_attr:
+                class_names = class_attr.split()
+                if class_names:
+                    tag = "button" if await button.evaluate("el => el.tagName.toLowerCase()") == "button" else "[role='button']"
+                    selector = f"{tag}.{class_names[0]}"
             elif button_text.strip():
                 selector = f'button:has-text("{button_text.strip()[:30]}")'
             else:
@@ -274,6 +289,8 @@ async def extract_page_structure(page):
                 {
                     "text": button_text.strip()[:50],
                     "id": button_id,
+                    "classes": class_attr,
+                    "dataTestId": data_testid,
                     "selector": selector,
                     "isSubmit": button_type == "submit",
                 }
@@ -299,12 +316,34 @@ async def extract_page_structure(page):
                 continue  # Skip links without text
 
             link_href = await link.get_attribute("href") or ""
+            link_id = await link.get_attribute("id") or ""
+            class_attr = await link.get_attribute("class") or ""
+            data_testid = await link.get_attribute("data-testid") or ""
+
+            # Create selector prioritizing ID and class
+            selector = None
+            if link_id:
+                selector = f"a#{link_id}"
+            elif data_testid:
+                selector = f'a[data-testid="{data_testid}"]'
+            elif class_attr:
+                class_names = class_attr.split()
+                if class_names:
+                    selector = f"a.{class_names[0]}"
+            else:
+                # Only use text selector as a last resort
+                selector = f'a:has-text("{link_text.strip()[:30]}")'
+                # list_selector = f'a:nth-child({i+1})'
 
             links.append(
                 {
                     "text": link_text.strip()[:50],
                     "href": link_href,
-                    "selector": f'a:has-text("{link_text.strip()[:30]}")',
+                    "id": link_id,
+                    "classes": class_attr,
+                    "dataTestId": data_testid,
+                    "selector": selector,
+                    "positionSelector": f"a:nth-child({i+1})"
                 }
             )
 
@@ -325,6 +364,7 @@ async def extract_page_structure(page):
 
             select_name = await select.get_attribute("name") or ""
             select_id = await select.get_attribute("id") or ""
+            class_attr = await select.get_attribute("class") or ""
 
             # Get label text
             label_text = ""
@@ -356,6 +396,10 @@ async def extract_page_structure(page):
             selector = None
             if select_id:
                 selector = f"#{select_id}"
+            elif class_attr:
+                class_names = class_attr.split()
+                if class_names:
+                    selector = f"select.{class_names[0]}"
             elif select_name:
                 selector = f'select[name="{select_name}"]'
             else:
@@ -365,6 +409,7 @@ async def extract_page_structure(page):
                 {
                     "name": select_name,
                     "id": select_id,
+                    "classes": class_attr,
                     "labelText": label_text.strip(),
                     "options": options,
                     "selector": selector,
@@ -384,6 +429,8 @@ async def extract_page_structure(page):
             form_id = await form.get_attribute("id") or ""
             form_action = await form.get_attribute("action") or ""
             form_method = await form.get_attribute("method") or "get"
+            class_attr = await form.get_attribute("class") or ""
+            data_testid = await form.get_attribute("data-testid") or ""
 
             # Find submit button
             submit_button = form.locator(
@@ -394,6 +441,7 @@ async def extract_page_structure(page):
 
             if await submit_button.count() > 0:
                 submit_id = await submit_button.get_attribute("id") or ""
+                submit_class = await submit_button.get_attribute("class") or ""
                 submit_text = (
                     await submit_button.text_content()
                     or await submit_button.get_attribute("value")
@@ -402,6 +450,11 @@ async def extract_page_structure(page):
 
                 if submit_id:
                     submit_selector = f"#{submit_id}"
+                elif submit_class:
+                    submit_class_names = submit_class.split()
+                    if submit_class_names:
+                        submit_tag = await submit_button.evaluate("el => el.tagName.toLowerCase()")
+                        submit_selector = f"{submit_tag}.{submit_class_names[0]}"
                 elif submit_text.strip():
                     submit_selector = f'button:has-text("{submit_text.strip()[:30]}")'
                 else:
@@ -411,12 +464,20 @@ async def extract_page_structure(page):
             selector = None
             if form_id:
                 selector = f"#{form_id}"
+            elif data_testid:
+                selector = f'form[data-testid="{data_testid}"]'
+            elif class_attr:
+                class_names = class_attr.split()
+                if class_names:
+                    selector = f"form.{class_names[0]}"
             else:
                 selector = "form"
 
             forms.append(
                 {
                     "id": form_id,
+                    "classes": class_attr,
+                    "dataTestId": data_testid,
                     "action": form_action,
                     "method": form_method,
                     "selector": selector,
@@ -445,6 +506,7 @@ async def extract_page_structure(page):
             checkbox_type = await checkbox.get_attribute("type") or ""
             checkbox_name = await checkbox.get_attribute("name") or ""
             checkbox_id = await checkbox.get_attribute("id") or ""
+            class_attr = await checkbox.get_attribute("class") or ""
             is_checked = await checkbox.is_checked()
 
             # Get label text
@@ -458,6 +520,10 @@ async def extract_page_structure(page):
             selector = None
             if checkbox_id:
                 selector = f"#{checkbox_id}"
+            elif class_attr:
+                class_names = class_attr.split()
+                if class_names:
+                    selector = f'input[type="{checkbox_type}"].{class_names[0]}'
             elif checkbox_name:
                 selector = f'input[name="{checkbox_name}"][type="{checkbox_type}"]'
             else:
@@ -468,6 +534,7 @@ async def extract_page_structure(page):
                     "type": checkbox_type,
                     "name": checkbox_name,
                     "id": checkbox_id,
+                    "classes": class_attr,
                     "labelText": label_text.strip(),
                     "checked": is_checked,
                     "selector": selector,
@@ -476,6 +543,54 @@ async def extract_page_structure(page):
 
         if checkboxes:
             interactive_elements["checkboxes"] = checkboxes
+            
+    # Extract image elements (useful for image-heavy sites like Unsplash)
+    images_locator = page.locator("img")
+    image_count = await images_locator.count()
+    if image_count > 0:
+        images = []
+        for i in range(min(image_count, 20)):  # Limit to 20 images
+            img = images_locator.nth(i)
+            
+            # Skip if not visible
+            if not await img.is_visible():
+                continue
+                
+            img_src = await img.get_attribute("src") or ""
+            img_alt = await img.get_attribute("alt") or ""
+            img_id = await img.get_attribute("id") or ""
+            class_attr = await img.get_attribute("class") or ""
+            data_testid = await img.get_attribute("data-testid") or ""
+            
+            # Create selector
+            selector = None
+            if img_id:
+                selector = f"img#{img_id}"
+            elif data_testid:
+                selector = f'img[data-testid="{data_testid}"]'
+            elif class_attr:
+                class_names = class_attr.split()
+                if class_names:
+                    selector = f"img.{class_names[0]}"
+            else:
+                if img_alt:
+                    selector = f'img[alt="{img_alt}"]'
+                else:
+                    selector = f"img:nth-child({i+1})"
+                    
+            images.append({
+                "src": img_src,
+                "alt": img_alt,
+                "id": img_id,
+                "classes": class_attr,
+                "dataTestId": data_testid,
+                "selector": selector,
+                "positionSelector": f"img:nth-child({i+1})",
+                "containerPositionSelector": f"img:nth-of-type({i+1})"
+            })
+        
+        if images:
+            interactive_elements["images"] = images
 
     if interactive_elements:
         result["interactiveElements"] = interactive_elements
