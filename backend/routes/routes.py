@@ -143,7 +143,6 @@ async def execute_command(session_id: str, request: InteractionRequest):
                     "results": command_result.get("results", []),
                     "task_status": completion_status,
                 },
-                screenshot_path=command_result.get("screenshot_path"),
             )
         else:
             # Command is still processing
@@ -166,8 +165,6 @@ async def command_status(session_id: str, command_id: str):
     Returns the current status and results if the command has completed
     """
     try:
-        logger.info(f"Checking status of command {command_id} in session {session_id}")
-
         result = await session_manager.get_command_result(session_id, command_id)
 
         # If the command is completed, check task status
@@ -272,8 +269,6 @@ async def get_session_status(session_id: str):
     try:
         from utils.browser_session import session_manager
 
-        logger.info(f"Checking status for session: {session_id}")
-
         session = await session_manager.get_session(session_id)
         if not session:
             raise HTTPException(
@@ -294,7 +289,6 @@ async def get_session_status(session_id: str):
         return {
             "status": "waiting_for_captcha" if is_waiting_for_captcha else "active",
             "session_info": status,
-            "screenshot_path": session.screenshot_path,
         }
 
     except Exception as e:

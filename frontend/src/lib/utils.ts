@@ -70,9 +70,7 @@ export interface SessionStatus {
     pending_commands: number;
     last_activity: number;
     current_url: string | null;
-    screenshot_path: string | null;
   };
-  screenshot_path: string | null;
 }
 
 export interface CommandStatus {
@@ -81,7 +79,6 @@ export interface CommandStatus {
     status: string;
     results: CommandResult[];
     explanation: string;
-    screenshot_path: string;
     task_completed: boolean;
   };
   task_status?: string;
@@ -90,5 +87,4 @@ export interface CommandStatus {
     last_action: string | null;
     current_explanation: string;
   };
-  screenshot_path?: string;
 }

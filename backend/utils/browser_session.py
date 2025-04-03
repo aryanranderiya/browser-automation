@@ -52,7 +52,6 @@ class BrowserSession:
         self.last_activity: float = time.time()
         self.session_data: Dict[str, Any] = {}  # Store session state like login info
         self.logger = setup_logger(f"session_{self.session_id[:8]}")
-        self.screenshot_path: Optional[str] = None
         self.captcha_resolved: asyncio.Event = asyncio.Event()
 
     async def start(self):
@@ -129,7 +128,6 @@ class BrowserSession:
                     return {
                         "status": "completed",
                         "result": command.result,
-                        "screenshot_path": self.screenshot_path,
                     }
                 else:
                     return {
@@ -150,23 +148,8 @@ class BrowserSession:
                 [cmd for cmd in self.command_queue if not cmd.processed]
             ),
             "last_activity": self.last_activity,
-            # "current_url": await self.page.url()
-            # if self.page and self.is_active
-            # else None,
             "current_url": self.page.url if self.page and self.is_active else None,
-            "screenshot_path": self.screenshot_path,
         }
-
-    async def take_screenshot(self) -> str:
-        """Take a screenshot of the current page"""
-        if not self.is_active or not self.page:
-            raise ValueError("Browser session is not active")
-
-        filename = f"screenshot_{self.session_id}_{int(time.time())}.png"
-        path = f"/tmp/{filename}"
-        await self.page.screenshot(path=path)
-        self.screenshot_path = path
-        return path
 
     async def _execute_command(self, command: BrowserCommand) -> Dict:
         """Execute a browser command and return the result"""
@@ -257,9 +240,6 @@ class BrowserSession:
                         # Reset the event (in case it was set previously)
                         self.captcha_resolved.clear()
 
-                        # Take a screenshot to show the captcha
-                        screenshot_path = await self.take_screenshot()
-
                         if self.wait_for_captcha:
                             # Wait for the captcha to be resolved - this will be resumed via the API
                             result = {
@@ -267,7 +247,6 @@ class BrowserSession:
                                 "message": message,
                                 "command": action,
                                 "waiting_for_user": True,
-                                "screenshot_path": screenshot_path,
                             }
 
                             # Wait for the event to be set
@@ -295,7 +274,6 @@ class BrowserSession:
                                 "success": False,
                                 "message": "Captcha detected but automatic waiting is disabled. Enable 'wait_for_captcha' to pause execution.",
                                 "command": action,
-                                "screenshot_path": screenshot_path,
                             }
                     else:
                         # For all other actions, use the BrowserAction executor
@@ -342,9 +320,6 @@ class BrowserSession:
                         )
                         break
 
-                # Take a screenshot after each iteration's command execution
-                screenshot_path = await self.take_screenshot()
-
                 # Short delay between iterations to prevent overloading the browser
                 await asyncio.sleep(
                     0.5
@@ -381,7 +356,6 @@ class BrowserSession:
                 "status": "success",
                 "results": command_chain_results,
                 "explanation": explanation,
-                "screenshot_path": screenshot_path,
                 "task_completed": task_completed,
             }
 
@@ -441,8 +415,6 @@ class BrowserSession:
                 ]
                 if captcha_errors and not self.wait_for_captcha:
                     summary += ". A captcha was detected but automatic waiting is disabled. Enable 'wait_for_captcha' to pause execution when captchas are detected."
-
-            # current_url = page_structure.get("url") if page_structure else "the page"
 
             if successful_actions and not failed_actions:
                 summary += ". The task was completed successfully."
@@ -600,12 +572,3 @@ class BrowserSessionManager:
 
 # Global instance
 session_manager = BrowserSessionManager()
-
-
-# Start background cleanup task
-# async def start_cleanup_task():
-# await session_manager.cleanup_inactive_sessions()
-#
-
-# # Initialize cleanup task when module is imported
-# asyncio.create_task(start_cleanup_task())

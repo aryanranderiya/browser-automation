@@ -20,7 +20,6 @@ class InteractionResponse(BaseModel):
     status: str
     message: str
     details: Optional[Dict] = None
-    screenshot_path: Optional[str] = None
 
 
 class ExtractRequest(BaseModel):
@@ -51,4 +50,3 @@ class ExtractResponse(BaseModel):
     status: str
     message: str
     data: Optional[Union[Dict, List, str]] = None
-    screenshot_path: Optional[str] = None

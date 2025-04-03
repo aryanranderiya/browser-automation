@@ -13,6 +13,17 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 
+// Define message types for the chat interface
+interface Message {
+  id: string;
+  type: "user" | "system" | "result";
+  content: string;
+  timestamp: Date;
+  status?: "pending" | "completed" | "error";
+  commandDetails?: any;
+  progressSteps?: { action: string; status: string; message?: string }[];
+}
+
 export default function BrowserAutomation() {
   // State for browser session
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -29,9 +40,10 @@ export default function BrowserAutomation() {
   const [commandStatus, setCommandStatus] = useState<CommandStatus | null>(
     null
   );
-  const [commandHistory, setCommandHistory] = useState<
-    { input: string; result: string }[]
-  >([]);
+
+  // Chat message history (replaces command history)
+  const [messages, setMessages] = useState<Message[]>([]);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // State for UI
   const [error, setError] = useState<string | null>(null);
@@ -54,6 +66,15 @@ export default function BrowserAutomation() {
 
       setSessionId(response.session_id);
       setSessionStatus(await api.getSessionStatus(response.session_id));
+
+      // Add a system message indicating the session has started
+      addMessage({
+        id: crypto.randomUUID(),
+        type: "system",
+        content: "Browser session started. What would you like to do?",
+        timestamp: new Date(),
+        status: "completed",
+      });
     } catch (err: any) {
       setError(`Failed to start browser: ${err.message}`);
     } finally {
@@ -70,6 +91,15 @@ export default function BrowserAutomation() {
       setError(null);
 
       await api.stopBrowser(sessionId);
+
+      // Add a system message indicating the session has stopped
+      addMessage({
+        id: crypto.randomUUID(),
+        type: "system",
+        content: "Browser session stopped.",
+        timestamp: new Date(),
+        status: "completed",
+      });
 
       // Clear session state
       setSessionId(null);
@@ -89,9 +119,35 @@ export default function BrowserAutomation() {
     }
   };
 
+  // Function to add a message to the chat
+  const addMessage = (message: Message) => {
+    setMessages((prev) => [...prev, message]);
+  };
+
   // Function to execute a command
   const executeCommand = async () => {
     if (!sessionId || !userInput.trim()) return;
+
+    // Generate a unique ID for this message
+    const messageId = crypto.randomUUID();
+
+    // Add user message
+    addMessage({
+      id: messageId,
+      type: "user",
+      content: userInput,
+      timestamp: new Date(),
+    });
+
+    // Add a pending result message
+    addMessage({
+      id: `${messageId}-result`,
+      type: "result",
+      content: "Processing your request...",
+      timestamp: new Date(),
+      status: "pending",
+      progressSteps: [],
+    });
 
     try {
       setIsExecutingCommand(true);
@@ -119,7 +175,53 @@ export default function BrowserAutomation() {
             );
             setCommandStatus(status);
 
-            // Also update session status to get latest screenshot
+            // Collect progress steps if available
+            let progressSteps: { action: string; status: string }[] = [];
+
+            if (status.progress) {
+              // Add current progress step
+              progressSteps = [
+                {
+                  action: status.progress.last_action || "Processing",
+                  status: "in-progress",
+                },
+              ];
+            }
+
+            // Add completed steps from results if available
+            if (status.result?.results) {
+              progressSteps = status.result.results.map(
+                (result: {
+                  command: string;
+                  success: boolean;
+                  message: Message;
+                }) => ({
+                  action: result.command,
+                  status: result.success ? "completed" : "failed",
+                  message: result.message,
+                })
+              );
+            }
+
+            // Update the result message with the latest status
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === `${messageId}-result`
+                  ? {
+                      ...msg,
+                      content:
+                        status.result?.explanation ||
+                        status.progress?.current_explanation ||
+                        "Processing your request...",
+                      status:
+                        status.status === "completed" ? "completed" : "pending",
+                      progressSteps,
+                      commandDetails: status.result,
+                    }
+                  : msg
+              )
+            );
+
             const sessionStatus = await api.getSessionStatus(sessionId);
             setSessionStatus(sessionStatus);
 
@@ -140,25 +242,42 @@ export default function BrowserAutomation() {
                 statusCheckInterval.current = null;
               }
 
-              // Add to command history
-              setCommandHistory((prev) => [
-                ...prev,
-                {
-                  input: userInput,
-                  result: status.result?.explanation || "Command executed",
-                },
-              ]);
-
               // Clear input
               setUserInput("");
             }
           } catch (err) {
             console.error("Error checking command status:", err);
+
+            // Update the result message with the error
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === `${messageId}-result`
+                  ? {
+                      ...msg,
+                      content: "Error checking command status",
+                      status: "error",
+                    }
+                  : msg
+              )
+            );
           }
         }, 1000);
       }
     } catch (err: any) {
       setError(`Failed to execute command: ${err.message}`);
+
+      // Update the result message with the error
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === `${messageId}-result`
+            ? {
+                ...msg,
+                content: `Failed to execute command: ${err.message}`,
+                status: "error",
+              }
+            : msg
+        )
+      );
     } finally {
       setIsExecutingCommand(false);
     }
@@ -171,10 +290,24 @@ export default function BrowserAutomation() {
     try {
       await api.resolveCaptcha(sessionId);
       setShowCaptchaPrompt(false);
+
+      // Add a system message about the captcha resolution
+      addMessage({
+        id: crypto.randomUUID(),
+        type: "system",
+        content: "Captcha has been resolved. Continuing with your request...",
+        timestamp: new Date(),
+        status: "completed",
+      });
     } catch (err: any) {
       setError(`Failed to signal captcha resolution: ${err.message}`);
     }
   };
+
+  // Scroll to bottom of chat when messages change
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   // Clean up interval on unmount
   useEffect(() => {
@@ -184,6 +317,82 @@ export default function BrowserAutomation() {
       }
     };
   }, []);
+
+  // Handle form submission
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (userInput.trim()) {
+      executeCommand();
+    }
+  };
+
+  // Handle key press in textarea (for Enter to send)
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Send on Enter without Shift (Shift+Enter creates a new line)
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (userInput.trim()) {
+        executeCommand();
+      }
+    }
+  };
+
+  // Function to periodically check session status
+  useEffect(() => {
+    let sessionCheckInterval: NodeJS.Timeout | null = null;
+
+    // Only run if we have a session ID
+    if (sessionId) {
+      // Check session status immediately
+      const checkSessionStatus = async () => {
+        try {
+          const status = await api.getSessionStatus(sessionId);
+          setSessionStatus(status);
+
+          // If the session is no longer active but our UI thinks it is,
+          // update the UI state
+          if (!status.session_info.is_active && sessionId) {
+            addMessage({
+              id: crypto.randomUUID(),
+              type: "system",
+              content:
+                "Browser session disconnected. Please start a new session.",
+              timestamp: new Date(),
+              status: "error",
+            });
+
+            // Clear session state
+            setSessionId(null);
+            setCommandStatus(null);
+            setCurrentCommandId(null);
+
+            // Clear polling intervals
+            if (statusCheckInterval.current) {
+              clearInterval(statusCheckInterval.current);
+              statusCheckInterval.current = null;
+            }
+          }
+        } catch (err) {
+          console.error("Error checking session status:", err);
+          // If we can't reach the backend, assume session is lost
+          setSessionId(null);
+        }
+      };
+
+      // Check status immediately
+      checkSessionStatus();
+
+      // Then set up interval to check periodically (every 5 seconds)
+      sessionCheckInterval = setInterval(checkSessionStatus, 5000);
+    }
+
+    // Clean up interval on unmount or when sessionId changes
+    return () => {
+      if (sessionCheckInterval) {
+        clearInterval(sessionCheckInterval);
+      }
+    };
+  }, [sessionId]);
 
   return (
     <div className="container mx-auto py-8 px-4">
@@ -200,7 +409,9 @@ export default function BrowserAutomation() {
             <h3 className="text-md font-medium mb-2">Browser Session</h3>
             {!sessionId ? (
               <Button onClick={startSession} disabled={isStartingSession}>
-                Start New Browser Session
+                {isStartingSession
+                  ? "Starting..."
+                  : "Start New Browser Session"}
               </Button>
             ) : (
               <div className="flex flex-col space-y-4">
@@ -218,34 +429,11 @@ export default function BrowserAutomation() {
                   variant="destructive"
                   disabled={isStoppingSession}
                 >
-                  Stop Browser Session
+                  {isStoppingSession ? "Stopping..." : "Stop Browser Session"}
                 </Button>
               </div>
             )}
           </div>
-
-          {/* Command input */}
-          {sessionId && (
-            <div className="mb-6">
-              <h3 className="text-md font-medium mb-2">Enter Command</h3>
-              <div className="flex flex-col space-y-2">
-                <Textarea
-                  placeholder="Enter a natural language command (e.g., 'Go to google.com and search for browser automation')"
-                  value={userInput}
-                  onChange={(e) => setUserInput(e.target.value)}
-                  className="min-h-[100px]"
-                />
-                <Button
-                  onClick={executeCommand}
-                  disabled={
-                    isExecutingCommand || !userInput.trim() || showCaptchaPrompt
-                  }
-                >
-                  Execute Command
-                </Button>
-              </div>
-            </div>
-          )}
 
           {/* Captcha prompt */}
           {showCaptchaPrompt && (
@@ -272,123 +460,195 @@ export default function BrowserAutomation() {
         </CardContent>
       </Card>
 
-      {/* Results display */}
+      {/* Chat interface */}
       {sessionId && (
-        <>
-          {/* Current result */}
-          {commandStatus?.status === "completed" && commandStatus.result && (
-            <Card className="mb-8">
-              <CardHeader>
-                <CardTitle>Current Action</CardTitle>
-                <CardDescription>
-                  {commandStatus.task_status === "completed"
-                    ? "Task completed successfully"
-                    : "Task in progress"}
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="mb-4">
-                  <h3 className="text-md font-medium mb-2">Result</h3>
-                  <p>{commandStatus.result.explanation}</p>
+        <Card>
+          <CardHeader>
+            <CardTitle>Browser Automation Chat</CardTitle>
+            <CardDescription>
+              Send commands and view results in a conversation format
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {/* Messages display */}
+            <div className="flex flex-col space-y-4 h-[500px] overflow-y-auto mb-4 p-4 border rounded-md">
+              {messages.length === 0 ? (
+                <div className="text-center text-gray-500 py-10">
+                  Your conversation will appear here. Start by sending a
+                  command.
                 </div>
+              ) : (
+                messages.map((message) => (
+                  <div
+                    key={message.id}
+                    className={`flex ${
+                      message.type === "user" ? "justify-end" : "justify-start"
+                    }`}
+                  >
+                    <div
+                      className={`rounded-lg p-4 max-w-[80%] ${
+                        message.type === "user"
+                          ? "bg-primary text-primary-foreground"
+                          : message.type === "system"
+                          ? "bg-secondary text-secondary-foreground"
+                          : "bg-muted text-muted-foreground"
+                      }`}
+                    >
+                      {/* Message content */}
+                      <div className="mb-2">
+                        {message.status === "pending" && (
+                          <div className="flex items-center mb-1">
+                            <div className="animate-pulse mr-2 h-2 w-2 rounded-full bg-current"></div>
+                            <span className="text-xs opacity-70">
+                              Processing...
+                            </span>
+                          </div>
+                        )}
+                        <p>{message.content}</p>
+                      </div>
 
-                {/* Display screenshot */}
-                {commandStatus.result.screenshot_path && (
-                  <div className="mb-4">
-                    <h3 className="text-md font-medium mb-2">Screenshot</h3>
-                    <div className="border rounded-md overflow-hidden">
-                      <img
-                        src={`http://localhost:8000/static${commandStatus.result.screenshot_path}`}
-                        alt="Browser screenshot"
-                        className="w-full h-auto"
-                      />
+                      {/* Progress steps */}
+                      {message.type === "result" &&
+                        message.progressSteps &&
+                        message.progressSteps.length > 0 && (
+                          <div className="mt-2 mb-3 border-t pt-2">
+                            <p className="text-sm font-medium mb-1">
+                              Progress:
+                            </p>
+                            <ul className="space-y-1">
+                              {message.progressSteps.map((step, idx) => (
+                                <li key={idx} className="flex items-start">
+                                  {step.status === "in-progress" ? (
+                                    <div className="flex-shrink-0 mr-2 mt-1">
+                                      <div className="animate-spin h-3 w-3 border-2 border-current border-t-transparent rounded-full"></div>
+                                    </div>
+                                  ) : step.status === "completed" ? (
+                                    <svg
+                                      className="flex-shrink-0 w-4 h-4 mr-1.5 text-green-500"
+                                      fill="currentColor"
+                                      viewBox="0 0 20 20"
+                                    >
+                                      <path
+                                        fillRule="evenodd"
+                                        d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z"
+                                        clipRule="evenodd"
+                                      ></path>
+                                    </svg>
+                                  ) : (
+                                    <svg
+                                      className="flex-shrink-0 w-4 h-4 mr-1.5 text-red-500"
+                                      fill="currentColor"
+                                      viewBox="0 0 20 20"
+                                    >
+                                      <path
+                                        fillRule="evenodd"
+                                        d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
+                                        clipRule="evenodd"
+                                      ></path>
+                                    </svg>
+                                  )}
+                                  <div className="text-xs">
+                                    <span>{step.action}</span>
+                                    {step.message && (
+                                      <span className="block text-xs opacity-75 mt-0.5">
+                                        {step.message}
+                                      </span>
+                                    )}
+                                  </div>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                      {/* Results details */}
+                      {message.type === "result" &&
+                        message.status === "completed" &&
+                        message.commandDetails && (
+                          <div className="mt-4 space-y-4">
+                            {/* Actions */}
+                            {message.commandDetails.results &&
+                              message.commandDetails.results.length > 0 && (
+                                <div>
+                                  <p className="text-sm font-medium mb-1">
+                                    Actions:
+                                  </p>
+                                  <div className="text-xs border rounded-md overflow-hidden">
+                                    <table className="min-w-full divide-y divide-gray-200">
+                                      <thead className="bg-gray-50">
+                                        <tr>
+                                          <th className="px-2 py-1 text-left font-medium text-gray-500">
+                                            Action
+                                          </th>
+                                          <th className="px-2 py-1 text-left font-medium text-gray-500">
+                                            Status
+                                          </th>
+                                        </tr>
+                                      </thead>
+                                      <tbody className="bg-white divide-y divide-gray-200">
+                                        {message.commandDetails.results.map(
+                                          (result: any, index: number) => (
+                                            <tr key={index}>
+                                              <td className="px-2 py-1 whitespace-nowrap">
+                                                {result.command}
+                                              </td>
+                                              <td className="px-2 py-1 whitespace-nowrap">
+                                                <span
+                                                  className={`inline-flex items-center px-1.5 py-0.5 rounded-full text-xs font-medium ${
+                                                    result.success
+                                                      ? "bg-green-100 text-green-800"
+                                                      : "bg-red-100 text-red-800"
+                                                  }`}
+                                                >
+                                                  {result.success
+                                                    ? "Success"
+                                                    : "Failed"}
+                                                </span>
+                                              </td>
+                                            </tr>
+                                          )
+                                        )}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </div>
+                              )}
+                          </div>
+                        )}
+
+                      {/* Timestamp */}
+                      <div className="text-xs opacity-70 mt-1">
+                        {message.timestamp.toLocaleTimeString()}
+                      </div>
                     </div>
                   </div>
-                )}
+                ))
+              )}
+              <div ref={messagesEndRef} />
+            </div>
 
-                {/* Actions history */}
-                {commandStatus.result.results &&
-                  commandStatus.result.results.length > 0 && (
-                    <div>
-                      <h3 className="text-md font-medium mb-2">
-                        Actions Performed
-                      </h3>
-                      <div className="border rounded-md overflow-hidden">
-                        <table className="min-w-full divide-y divide-gray-200">
-                          <thead className="bg-gray-50">
-                            <tr>
-                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                Action
-                              </th>
-                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                Status
-                              </th>
-                              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                                Message
-                              </th>
-                            </tr>
-                          </thead>
-                          <tbody className="bg-white divide-y divide-gray-200">
-                            {commandStatus.result.results.map(
-                              (result, index) => (
-                                <tr key={index}>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                                    {result.command}
-                                  </td>
-                                  <td className="px-6 py-4 whitespace-nowrap text-sm">
-                                    <span
-                                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                                        result.success
-                                          ? "bg-green-100 text-green-800"
-                                          : "bg-red-100 text-red-800"
-                                      }`}
-                                    >
-                                      {result.success ? "Success" : "Failed"}
-                                    </span>
-                                  </td>
-                                  <td className="px-6 py-4 text-sm text-gray-500">
-                                    {result.message}
-                                  </td>
-                                </tr>
-                              )
-                            )}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  )}
-              </CardContent>
-            </Card>
-          )}
-
-          {/* Command history */}
-          {commandHistory.length > 0 && (
-            <Card>
-              <CardHeader>
-                <CardTitle>Command History</CardTitle>
-                <CardDescription>
-                  Previous commands and their results
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="space-y-4">
-                  {commandHistory.map((cmd, index) => (
-                    <div key={index} className="border rounded-md p-4">
-                      <div className="mb-2">
-                        <span className="font-medium">Command:</span>{" "}
-                        {cmd.input}
-                      </div>
-                      <div>
-                        <span className="font-medium">Result:</span>{" "}
-                        {cmd.result}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
-          )}
-        </>
+            {/* Command input */}
+            <form onSubmit={handleSubmit} className="flex flex-col space-y-2">
+              <Textarea
+                placeholder="Enter a command (e.g., 'Go to google.com and search for browser automation')"
+                value={userInput}
+                onChange={(e) => setUserInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                className="min-h-[80px]"
+                disabled={isExecutingCommand || showCaptchaPrompt}
+              />
+              <Button
+                type="submit"
+                disabled={
+                  isExecutingCommand || !userInput.trim() || showCaptchaPrompt
+                }
+                className="self-end"
+              >
+                {isExecutingCommand ? "Processing..." : "Send Command"}
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
       )}
     </div>
   );

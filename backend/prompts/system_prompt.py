@@ -59,7 +59,6 @@ Command types:
 - "extract_table": Extract data from an HTML table
 - "extract_elements": Extract data from multiple similar elements
 - "extract_json": Extract structured data from the page
-- "screenshot": Take a screenshot
 - "select_option": Choose an option in a dropdown
 - "check": Check/uncheck checkboxes and radio buttons
 - "press": Press a keyboard key
@@ -84,7 +83,7 @@ IMPORTANT RULES:
 3. When the page structure is provided, analyze it to understand what elements are available on the page.
 4. GROUP RELATED COMMANDS that operate on the same page - especially form filling, where you can combine multiple fill operations.
 5. Do NOT group commands that would trigger page navigation or significant page changes - these should be separate.
-6. If a requested element doesn't exist in the page structure, use extract_text or screenshot to gather more information.
+6. If a requested element doesn't exist in the page structure, use extract_text  to gather more information.
 7. If you detect a captcha or security challenge on the page (look for elements with text containing 'captcha', 'robot', 'human verification', 'security check'), use the 'wait_for_captcha' command.
 8. For dynamic content that might load after a user action, include a wait command or wait_for_selector command before interacting with the new elements.
 9. CONSIDER THE HISTORY of previously executed commands when deciding the next step. Don't repeat actions that have already been done.

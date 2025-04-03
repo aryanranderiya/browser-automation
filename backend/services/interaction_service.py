@@ -51,7 +51,6 @@ async def execute_browser_interaction(
                             "results": results,
                             "explanation": command_result.get("explanation", ""),
                         },
-                        screenshot_path=command_result.get("screenshot_path"),
                     )
 
                 # If not waiting for captcha, stop the session if it was created for this request
@@ -62,7 +61,6 @@ async def execute_browser_interaction(
                     status=status,
                     message=command_result.get("explanation", ""),
                     details={"results": results, "session_id": session_id},
-                    screenshot_path=command_result.get("screenshot_path"),
                 )
 
             await asyncio.sleep(0.5)

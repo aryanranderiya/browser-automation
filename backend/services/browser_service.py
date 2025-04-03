@@ -51,27 +51,14 @@ class BrowserAction:
                 # First check if we need to navigate before searching
                 current_url = self.page.url
                 if current_url == "about:blank" or not current_url:
-                    # Capture a screenshot to show the current state
-                    screenshot_path = (
-                        f"/tmp/blank_page_screenshot_{int(time.time())}.png"
-                    )
-                    await self.page.screenshot(path=screenshot_path)
-
                     # Instead of failing immediately, provide a more helpful response
-                    self.logger.warning(
-                        f"Cannot search on blank page. Taking screenshot to {screenshot_path}"
-                    )
+                    self.logger.warning(f"Cannot search on blank page.")
                     result["success"] = False
                     result["message"] = (
                         "Cannot search on an empty page. A navigation command is required first."
                     )
                     result["needs_navigation"] = True
-                    result["screenshot_path"] = screenshot_path
                     return result
-
-                # Take a screenshot before trying to search for debugging
-                debug_screenshot = f"/tmp/pre_search_debug_{int(time.time())}.png"
-                await self.page.screenshot(path=debug_screenshot)
 
                 # Make sure page is fully loaded
                 try:
@@ -82,7 +69,6 @@ class BrowserAction:
                 except PlaywrightTimeoutError:
                     error_msg = "Timeout waiting for page to load before searching"
                     result["message"] = error_msg
-                    result["screenshot_path"] = debug_screenshot
                     raise TimeoutError(error_msg, {"query": query})
 
                 # Now wait for selector with better error handling
@@ -133,7 +119,6 @@ class BrowserAction:
 
                     error_msg = f"Search element with selector '{selector}' not found on page: {current_url}"
                     result["message"] = error_msg
-                    result["screenshot_path"] = debug_screenshot
                     raise ElementNotFoundError(error_msg, {"selector": selector})
 
                 # Fill and submit the search
@@ -195,16 +180,6 @@ class BrowserAction:
                 result["success"] = True
                 result["message"] = f"Waited for {seconds} seconds"
 
-            elif action == "screenshot":
-                filename = f"screenshot_{int(time.time())}.png"
-                path = f"/tmp/{filename}"
-                self.logger.info(f"Taking screenshot and saving to {path}")
-
-                await self.page.screenshot(path=path)
-                result["success"] = True
-                result["message"] = "Screenshot captured"
-                result["screenshot_path"] = path
-
             elif action == "wait_for_captcha":
                 message = command.get(
                     "message",
@@ -212,18 +187,12 @@ class BrowserAction:
                 )
                 self.logger.info("Detected captcha, waiting for user resolution")
 
-                # Take a screenshot to show the captcha
-                filename = f"captcha_screenshot_{int(time.time())}.png"
-                path = f"/tmp/{filename}"
-                await self.page.screenshot(path=path)
-
                 # Since BrowserAction doesn't have access to the Event object for signaling,
                 # we can only return a result indicating captcha was detected
                 result = {
                     "success": True,
                     "message": message,
                     "command": action,
-                    "screenshot_path": path,
                     # This flag will be used by the caller to determine if user interaction is needed
                     "waiting_for_user": True,
                 }
