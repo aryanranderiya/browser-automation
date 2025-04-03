@@ -106,8 +106,38 @@ async def extract_page_structure(page):
     """
     Extracts the structure of the current page including important interactive elements.
     This helps the LLM understand what elements are actually available for interaction.
+
+    Note: We use a hybrid approach here - using locators for basic page details
+    and a more focused evaluate call for the complex extraction of interactive elements
+    and page structure.
     """
-    return await page.evaluate("""() => {
+    # Extract basic page info using locators
+    url = page.url
+    title = await page.title()
+
+    # Check for basic features
+    has_captcha = (
+        await page.locator(
+            "text=/captcha|recaptcha|cloudflare|i'm not a robot/i"
+        ).count()
+        > 0
+    )
+    has_login_form = (
+        await page.locator('input[type="password"]').count() > 0
+        or await page.locator("text=/sign in|log in/i").count() > 0
+    )
+    has_navigation = await page.locator('nav, [role="navigation"]').count() > 0
+    has_search_box = (
+        await page.locator(
+            'input[type="search"], input[name*="search"], input[placeholder*="search" i], input[aria-label*="search" i]'
+        ).count()
+        > 0
+    )
+
+    # Use evaluate call for the complex element extraction since it's more efficient than
+    # multiple locator calls for this specific case
+    # This is more focused than before, only extracting interactive elements
+    page_details = await page.evaluate("""() => {
         // Helper function to get a simplified DOM path
         function getElementPath(element, maxLength = 80) {
             let path = '';
@@ -203,203 +233,6 @@ async def extract_page_structure(page):
             // Last resort
             return element.tagName.toLowerCase();
         }
-
-        // Function to extract interactive elements with improved selectors
-        function extractInteractiveElements() {
-            const interactive = {
-                inputs: [],
-                buttons: [],
-                links: [],
-                selects: [],
-                forms: [],
-                images: [],
-                checkboxes: []
-            };
-            
-            // Get input fields with improved handling
-            document.querySelectorAll('input:not([type="hidden"]):not([disabled]), textarea:not([disabled])').forEach(el => {
-                const visibleText = el.labels ? Array.from(el.labels).map(label => label.textContent.trim()).join(' ') : '';
-                const placeholder = el.placeholder || '';
-                const selector = getCssSelector(el);
-                
-                interactive.inputs.push({
-                    type: el.type || 'text',
-                    name: el.name || '',
-                    id: el.id || '',
-                    placeholder: placeholder,
-                    labelText: visibleText,
-                    value: el.value || '',
-                    path: getElementPath(el),
-                    selector: selector,
-                    isRequired: el.required,
-                    isDisabled: el.disabled,
-                    isVisible: isElementVisible(el)
-                });
-            });
-            
-            // Get buttons with more context
-            document.querySelectorAll('button:not([disabled]), [type="button"]:not([disabled]), [type="submit"]:not([disabled]), [role="button"]:not([disabled])').forEach(el => {
-                const text = el.innerText.trim().substring(0, 50);
-                const ariaLabel = el.getAttribute('aria-label') || '';
-                const selector = getCssSelector(el);
-                
-                interactive.buttons.push({
-                    text: text,
-                    ariaLabel: ariaLabel,
-                    id: el.id || '',
-                    path: getElementPath(el),
-                    selector: selector,
-                    hasIcon: el.querySelector('i, svg, img') !== null,
-                    isPrimary: el.classList.contains('primary') || el.classList.contains('btn-primary'),
-                    isSubmit: el.type === 'submit',
-                    isVisible: isElementVisible(el)
-                });
-            });
-            
-            // Get links with better context
-            document.querySelectorAll('a:not([disabled])').forEach(el => {
-                const text = el.innerText.trim().substring(0, 50);
-                const selector = getCssSelector(el);
-                
-                interactive.links.push({
-                    text: text,
-                    href: el.href || '',
-                    id: el.id || '',
-                    title: el.title || '',
-                    path: getElementPath(el),
-                    selector: selector,
-                    isNavigation: isLikelyNavigationLink(el),
-                    isExternal: el.hostname !== window.location.hostname,
-                    isVisible: isElementVisible(el)
-                });
-            });
-            
-            // Get select dropdowns with options
-            document.querySelectorAll('select:not([disabled])').forEach(el => {
-                const selector = getCssSelector(el);
-                const labelText = getSelectLabel(el);
-                
-                interactive.selects.push({
-                    name: el.name || '',
-                    id: el.id || '',
-                    labelText: labelText,
-                    options: Array.from(el.options).map(opt => ({
-                        text: opt.text,
-                        value: opt.value,
-                        selected: opt.selected
-                    })).slice(0, 15), // Limit to 15 options for brevity
-                    path: getElementPath(el),
-                    selector: selector,
-                    isRequired: el.required,
-                    isVisible: isElementVisible(el)
-                });
-            });
-            
-            // Get forms with their fields
-            document.querySelectorAll('form').forEach(el => {
-                const fields = Array.from(el.querySelectorAll('input:not([type="hidden"]), select, textarea')).map(field => {
-                    return {
-                        type: field.tagName.toLowerCase() === 'select' ? 'select' : field.type || 'text',
-                        name: field.name || '',
-                        id: field.id || '',
-                        selector: getCssSelector(field),
-                        required: field.required
-                    };
-                });
-                
-                const submitButton = el.querySelector('button[type="submit"], input[type="submit"]');
-                
-                interactive.forms.push({
-                    id: el.id || '',
-                    action: el.action || '',
-                    method: el.method || 'get',
-                    path: getElementPath(el),
-                    selector: getCssSelector(el),
-                    fields: fields,
-                    submitSelector: submitButton ? getCssSelector(submitButton) : null,
-                    submitText: submitButton ? (submitButton.innerText.trim() || submitButton.value) : ''
-                });
-            });
-            
-            // Get checkboxes and radio buttons
-            document.querySelectorAll('input[type="checkbox"]:not([disabled]), input[type="radio"]:not([disabled])').forEach(el => {
-                const labelText = el.labels ? Array.from(el.labels).map(label => label.textContent.trim()).join(' ') : '';
-                const selector = getCssSelector(el);
-                
-                interactive.checkboxes.push({
-                    type: el.type,
-                    name: el.name || '',
-                    id: el.id || '',
-                    labelText: labelText,
-                    checked: el.checked,
-                    selector: selector,
-                    isRequired: el.required,
-                    isVisible: isElementVisible(el)
-                });
-            });
-            
-            // Get important images
-            document.querySelectorAll('img[alt]:not([alt=""]), img[src*="logo"], img[class*="logo"], svg').forEach(el => {
-                if (el.width < 5 || el.height < 5) return; // Skip tiny images
-                
-                interactive.images.push({
-                    alt: el.alt || '',
-                    src: el.src || '',
-                    selector: getCssSelector(el),
-                    isLogo: isLikelyLogo(el),
-                    width: el.width,
-                    height: el.height
-                });
-            });
-            
-            return interactive;
-        }
-        
-        // Helper: Check if element is a logo
-        function isLikelyLogo(el) {
-            if (el.alt && el.alt.toLowerCase().includes('logo')) return true;
-            if (el.src && el.src.toLowerCase().includes('logo')) return true;
-            if (el.className && el.className.toLowerCase().includes('logo')) return true;
-            if (el.id && el.id.toLowerCase().includes('logo')) return true;
-            
-            // Check if it's in the header area
-            const rect = el.getBoundingClientRect();
-            return rect.top < 150 && (rect.left < 300 || rect.right > window.innerWidth - 300);
-        }
-        
-        // Helper: Check if link is likely a navigation link
-        function isLikelyNavigationLink(el) {
-            // Check if in navigation element
-            if (el.closest('nav, [role="navigation"], .nav, .navigation, .menu, header')) return true;
-            
-            // Check if it has navigation-like classes
-            if (el.className && /nav|menu|header|top|main/.test(el.className.toLowerCase())) return true;
-            
-            return false;
-        }
-        
-        // Helper: Get a select element's label text
-        function getSelectLabel(selectEl) {
-            // First check for an associated label
-            if (selectEl.id) {
-                const label = document.querySelector(`label[for="${selectEl.id}"]`);
-                if (label) return label.textContent.trim();
-            }
-            
-            // Look for a sibling or parent label
-            const parentLabel = selectEl.closest('label');
-            if (parentLabel) {
-                return parentLabel.textContent.replace(selectEl.outerHTML, '').trim();
-            }
-            
-            // Look for nearby text that might be a label
-            const prev = selectEl.previousElementSibling;
-            if (prev && (prev.tagName === 'LABEL' || prev.tagName === 'SPAN' || prev.tagName === 'DIV')) {
-                return prev.textContent.trim();
-            }
-            
-            return '';
-        }
         
         // Helper: Check if element is visible on page
         function isElementVisible(el) {
@@ -419,141 +252,145 @@ async def extract_page_structure(page):
             return true;
         }
 
-        // Extract page structure with enhanced metadata
-        function extractPageStructure() {
-            // Basic page info
-            const title = document.title;
-            const url = window.location.href;
-            const domain = window.location.hostname;
-            const metaDescription = document.querySelector('meta[name="description"]')?.content || '';
-            
-            // Extract website type/category based on content
-            const pageType = determinePageType();
-            
-            // Extract visible text (truncated)
-            const mainText = document.body.innerText.substring(0, 500) + 
-                            (document.body.innerText.length > 500 ? '...' : '');
-            
-            // Extract main heading
-            const h1Text = Array.from(document.querySelectorAll('h1'))
-                .map(h => h.innerText.trim())
-                .filter(Boolean)
-                .join(' | ');
-                
-            const h2Text = Array.from(document.querySelectorAll('h2'))
-                .map(h => h.innerText.trim())
-                .filter(Boolean)
-                .slice(0, 5)
-                .join(' | ') + 
-                (document.querySelectorAll('h2').length > 5 ? '...' : '');
-            
-            // Extract main content areas
-            const mainContentText = extractMainContent();
-            
-            // Check for important UI components
-            const hasLoginForm = !!document.querySelector('form input[type="password"]') ||
-                                document.body.innerText.toLowerCase().includes('sign in') ||
-                                document.body.innerText.toLowerCase().includes('log in');
-            
-            const hasCaptcha = document.body.innerHTML.toLowerCase().includes('captcha') ||
-                            document.body.innerHTML.toLowerCase().includes('recaptcha') ||
-                            document.body.innerHTML.toLowerCase().includes('cloudflare') ||
-                            document.body.innerText.toLowerCase().includes('i\'m not a robot');
-            
-            const hasNavigation = !!document.querySelector('nav, [role="navigation"]');
-            
-            const hasSearchBox = !!document.querySelector('input[type="search"], input[name*="search"], input[placeholder*="search" i], input[aria-label*="search" i]');
-            
-            return {
-                title,
-                url,
-                domain,
-                metaDescription,
-                pageType,
-                mainText,
-                mainContentText,
-                headings: {
-                    h1: h1Text,
-                    h2: h2Text
-                },
-                pageFeatures: {
-                    hasLoginForm,
-                    hasCaptcha,
-                    hasNavigation,
-                    hasSearchBox
-                },
-                interactiveElements: extractInteractiveElements()
-            };
-        }
+        // Extract interactive elements only - more focused approach
+        const interactiveElements = {
+            inputs: [],
+            buttons: [],
+            links: [],
+            selects: [],
+            forms: [],
+            checkboxes: []
+        };
         
-        // Helper: Determine type of website
-        function determinePageType() {
-            const url = window.location.href.toLowerCase();
-            const title = document.title.toLowerCase();
-            const bodyText = document.body.innerText.toLowerCase();
+        // Extract inputs
+        document.querySelectorAll('input:not([type="hidden"]):not([disabled]), textarea:not([disabled])').forEach(el => {
+            if (!isElementVisible(el)) return;
             
-            // E-commerce indicators
-            if (
-                url.includes('shop') || url.includes('store') || 
-                title.includes('shop') || title.includes('store') || 
-                bodyText.includes('shopping cart') || bodyText.includes('add to cart') ||
-                bodyText.includes('checkout') || document.querySelector('.product, .price, [data-product-id]')
-            ) {
-                return 'e-commerce';
-            }
+            const visibleText = el.labels ? Array.from(el.labels).map(label => label.textContent.trim()).join(' ') : '';
+            const placeholder = el.placeholder || '';
+            const selector = getCssSelector(el);
             
-            // Search engine
-            if (
-                url.includes('search') || title.includes('search') ||
-                bodyText.includes('search results') || 
-                document.querySelector('input[type="search"], form[role="search"]')
-            ) {
-                return 'search';
-            }
-            
-            // Social media
-            if (
-                url.includes('feed') || url.includes('profile') || 
-                bodyText.includes('follow') || bodyText.includes('like') ||
-                bodyText.includes('comment') || bodyText.includes('share')
-            ) {
-                return 'social-media';
-            }
-            
-            // News or blog
-            if (
-                url.includes('news') || url.includes('article') || url.includes('blog') ||
-                title.includes('news') || document.querySelector('article, .article, .post')
-            ) {
-                return 'news-or-blog';
-            }
-            
-            // Login page
-            if (
-                url.includes('login') || url.includes('signin') || 
-                bodyText.includes('login') || bodyText.includes('sign in') ||
-                document.querySelector('input[type="password"]')
-            ) {
-                return 'login';
-            }
-            
-            return 'general'; // Default
-        }
+            interactiveElements.inputs.push({
+                type: el.type || 'text',
+                name: el.name || '',
+                id: el.id || '',
+                placeholder: placeholder,
+                labelText: visibleText,
+                selector: selector,
+                isRequired: el.required
+            });
+        });
         
-        // Helper: Extract the main content by looking for main content containers
-        function extractMainContent() {
-            // Look for common main content containers
-            const mainContent = document.querySelector('main, [role="main"], #main, .main, #content, .content, article');
+        // Extract buttons
+        document.querySelectorAll('button:not([disabled]), [type="button"]:not([disabled]), [type="submit"]:not([disabled]), [role="button"]:not([disabled])').forEach(el => {
+            if (!isElementVisible(el)) return;
             
-            if (mainContent) {
-                return mainContent.innerText.substring(0, 1000) + 
-                      (mainContent.innerText.length > 1000 ? '...' : '');
-            }
+            const text = el.innerText.trim().substring(0, 50);
+            const selector = getCssSelector(el);
             
-            // Fallback to body text
-            return document.body.innerText.substring(0, 500) + 
-                  (document.body.innerText.length > 500 ? '...' : '');
-        }
+            interactiveElements.buttons.push({
+                text: text,
+                id: el.id || '',
+                selector: selector,
+                isSubmit: el.type === 'submit'
+            });
+        });
         
-        return extractPageStructure();
+        // Extract links
+        document.querySelectorAll('a:not([disabled])').forEach(el => {
+            if (!isElementVisible(el)) return;
+            
+            const text = el.innerText.trim().substring(0, 50);
+            const selector = getCssSelector(el);
+            
+            interactiveElements.links.push({
+                text: text,
+                href: el.href || '',
+                selector: selector
+            });
+        });
+        
+        // Extract select elements
+        document.querySelectorAll('select:not([disabled])').forEach(el => {
+            if (!isElementVisible(el)) return;
+            
+            const selector = getCssSelector(el);
+            const labelText = el.labels ? Array.from(el.labels).map(label => label.textContent.trim()).join(' ') : '';
+            
+            interactiveElements.selects.push({
+                name: el.name || '',
+                id: el.id || '',
+                labelText: labelText,
+                options: Array.from(el.options).map(opt => ({
+                    text: opt.text,
+                    value: opt.value,
+                    selected: opt.selected
+                })).slice(0, 15), // Limit options for brevity
+                selector: selector
+            });
+        });
+        
+        // Extract form elements
+        document.querySelectorAll('form').forEach(el => {
+            const submitButton = el.querySelector('button[type="submit"], input[type="submit"]');
+            
+            interactiveElements.forms.push({
+                id: el.id || '',
+                action: el.action || '',
+                method: el.method || 'get',
+                selector: getCssSelector(el),
+                submitSelector: submitButton ? getCssSelector(submitButton) : null,
+                submitText: submitButton ? (submitButton.innerText.trim() || submitButton.value) : ''
+            });
+        });
+        
+        // Extract checkboxes and radio buttons
+        document.querySelectorAll('input[type="checkbox"]:not([disabled]), input[type="radio"]:not([disabled])').forEach(el => {
+            if (!isElementVisible(el)) return;
+            
+            const labelText = el.labels ? Array.from(el.labels).map(label => label.textContent.trim()).join(' ') : '';
+            const selector = getCssSelector(el);
+            
+            interactiveElements.checkboxes.push({
+                type: el.type,
+                name: el.name || '',
+                id: el.id || '',
+                labelText: labelText,
+                checked: el.checked,
+                selector: selector
+            });
+        });
+        
+        // Extract headings as they provide context
+        const headings = {
+            h1: Array.from(document.querySelectorAll('h1')).map(h => h.innerText.trim()).filter(Boolean),
+            h2: Array.from(document.querySelectorAll('h2')).slice(0, 5).map(h => h.innerText.trim()).filter(Boolean)
+        };
+        
+        // Extract main content text (truncated)
+        const mainContent = document.querySelector('main, [role="main"], #main, .main, #content, .content, article');
+        const mainText = mainContent 
+            ? mainContent.innerText.substring(0, 500) + (mainContent.innerText.length > 500 ? '...' : '')
+            : document.body.innerText.substring(0, 300) + (document.body.innerText.length > 300 ? '...' : '');
+            
+        return {
+            interactiveElements,
+            headings,
+            mainText
+        };
     }""")
+
+    # Combine the data from locators and evaluate
+    return {
+        "title": title,
+        "url": url,
+        "pageFeatures": {
+            "hasCaptcha": has_captcha,
+            "hasLoginForm": has_login_form,
+            "hasNavigation": has_navigation,
+            "hasSearchBox": has_search_box,
+        },
+        "headings": page_details["headings"],
+        "mainText": page_details["mainText"],
+        "interactiveElements": page_details["interactiveElements"],
+    }

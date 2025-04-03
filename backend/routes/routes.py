@@ -130,6 +130,10 @@ async def execute_command(session_id: str, request: InteractionRequest):
             command_result = result.get("result", {})
             status = "success" if command_result.get("status") != "error" else "error"
 
+            # Check if task was completed
+            task_completed = command_result.get("task_completed", False)
+            completion_status = "completed" if task_completed else "in_progress"
+
             return InteractionResponse(
                 status=status,
                 message=command_result.get("explanation", "Command executed"),
@@ -137,6 +141,7 @@ async def execute_command(session_id: str, request: InteractionRequest):
                     "command_id": command_id,
                     "session_id": session_id,
                     "results": command_result.get("results", []),
+                    "task_status": completion_status,
                 },
                 screenshot_path=command_result.get("screenshot_path"),
             )
@@ -164,6 +169,30 @@ async def command_status(session_id: str, command_id: str):
         logger.info(f"Checking status of command {command_id} in session {session_id}")
 
         result = await session_manager.get_command_result(session_id, command_id)
+
+        # If the command is completed, check task status
+        if result.get("status") == "completed":
+            command_result = result.get("result", {})
+
+            # Add task completion information
+            task_completed = command_result.get("task_completed", False)
+            completion_status = "completed" if task_completed else "in_progress"
+
+            result["task_status"] = completion_status
+
+            # If task is still in progress, add more context about progress
+            if not task_completed and "results" in command_result:
+                # Get count of actions completed
+                completed_actions = len(command_result.get("results", []))
+                result["progress"] = {
+                    "actions_completed": completed_actions,
+                    "last_action": command_result["results"][-1].get(
+                        "command", "unknown"
+                    )
+                    if completed_actions > 0
+                    else None,
+                    "current_explanation": command_result.get("explanation", ""),
+                }
 
         return result
 
