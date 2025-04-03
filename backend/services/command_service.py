@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -10,9 +10,40 @@ from prompts.system_prompt import system_prompt
 load_dotenv()
 logger = setup_logger("command_service")
 
-client = OpenAI(
-    base_url="https://api.groq.com/openai/v1", api_key=os.environ.get("GROQ_API_KEY")
-)
+
+def initialize_client() -> Tuple[OpenAI, str, str]:
+    """Initialize the appropriate client based on available API keys.
+    Returns a tuple of (client, api_provider, default_model)"""
+    if os.environ.get("GROQ_API_KEY"):
+        logger.info("Using Groq API")
+        return (
+            OpenAI(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=os.environ.get("GROQ_API_KEY"),
+            ),
+            "groq",
+            "llama-3.1-8b-instant",
+        )
+    elif os.environ.get("GEMINI_API_KEY"):
+        logger.info("Using Gemini API")
+        return (
+            OpenAI(
+                base_url="https://generativelanguage.googleapis.com/v1beta/",
+                api_key=os.environ.get("GEMINI_API_KEY"),
+            ),
+            "gemini",
+            "gemini-1.5-flash",
+        )
+    else:
+        logger.info("Using default OpenAI API")
+        return (
+            OpenAI(api_key=os.environ.get("OPENAI_API_KEY")),
+            "openai",
+            "gpt-3.5-turbo",
+        )
+
+
+client, API_PROVIDER, DEFAULT_MODEL = initialize_client()
 
 
 def get_browser_commands(
@@ -126,24 +157,23 @@ IMPORTANT:
             user_content += f"\n\nCHRONOLOGICAL HISTORY OF PREVIOUS ACTIONS:\n{task_progress_context}"
             user_content += "\nBased on the above history and current page state, determine the next logical step(s)."
 
-        # Check if we need to determine task completion
-        is_task_completion_check = False
-        if previous_commands and len(previous_commands) > 0:
-            # Add completion check instruction
-            user_content += "\n\nTASK COMPLETION CHECK: Based on the user's original request and actions taken so far, is the task FULLY COMPLETED? If the task is complete, add 'task_completed': true to your command JSON and include a task_summary field explaining what was accomplished."
-            is_task_completion_check = True
+        # Use the API_PROVIDER and DEFAULT_MODEL constants instead of checking base_url
+        model = DEFAULT_MODEL
+        response_format = {"type": "json_object"}
+
+        logger.info(f"Using API provider: {API_PROVIDER} with model: {model}")
 
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model=model,
             messages=[
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": user_content},
             ],
-            response_format={"type": "json_object"},
+            response_format=response_format,
         )
 
         content = response.choices[0].message.content
-        logger.info("Received JSON response from LLM")
+        logger.info(f"Received JSON response from LLM: {content}")
 
         parsed_response = json.loads(content)
         commands = parsed_response.get("commands", [])

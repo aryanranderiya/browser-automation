@@ -467,6 +467,47 @@ class BrowserAction:
                     result["message"] = error_msg
                     raise ExtractorError(error_msg, {"error": str(e)})
 
+            elif action == "press":
+                key = command.get("key")
+                selector = command.get("selector", None)
+                self.logger.info(
+                    f"Pressing key {key}" + (f" on {selector}" if selector else "")
+                )
+
+                try:
+                    if selector:
+                        # Wait for the selector if specified
+                        await self.page.wait_for_selector(
+                            selector, timeout=self.timeout * 1000
+                        )
+                        # Press the key on the specified element
+                        await self.page.press(selector, key)
+                    else:
+                        # Press the key on the active element or page
+                        await self.page.keyboard.press(key)
+
+                    result["success"] = True
+                    result["message"] = f"Pressed {key}" + (
+                        f" on {selector}" if selector else ""
+                    )
+                except PlaywrightTimeoutError:
+                    if selector:
+                        error_msg = f"Element with selector '{selector}' not found for key press"
+                        result["message"] = error_msg
+                        raise ElementNotFoundError(
+                            error_msg, {"selector": selector, "key": key}
+                        )
+                    else:
+                        error_msg = f"Failed to press {key}"
+                        result["message"] = error_msg
+                        raise BrowserAutomationError(error_msg, {"key": key})
+                except Exception as e:
+                    error_msg = f"Error pressing {key}: {str(e)}"
+                    result["message"] = error_msg
+                    raise BrowserAutomationError(
+                        error_msg, {"key": key, "error": str(e)}
+                    )
+
             else:
                 error_msg = f"Unknown command type: {action}"
                 result["message"] = error_msg
