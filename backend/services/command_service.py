@@ -32,7 +32,9 @@ def initialize_client() -> Tuple[OpenAI, str, str]:
                 api_key=os.environ.get("GEMINI_API_KEY"),
             ),
             "gemini",
-            "gemini-1.5-flash",
+            "gemini-2.5-pro-exp-03-25",
+            # "gemini-1.5-flash",
+            # "gemini-2.0-flash-lite",
         )
     else:
         logger.info("Using default OpenAI API")
@@ -173,10 +175,45 @@ IMPORTANT:
         )
 
         content = response.choices[0].message.content
-        logger.info(f"Received JSON response from LLM: {content}")
+        logger.info(f"Received JSON response from LLM: {content=} {page_structure=}")
 
-        parsed_response = json.loads(content)
+        # Fix common JSON formatting issues before parsing
+        try:
+            parsed_response = json.loads(content)
+
+        except json.JSONDecodeError as json_err:
+            # Try to fix common issues with boolean values being strings
+            if "Expecting ',' delimiter" in str(
+                json_err
+            ) or "Expecting property name" in str(json_err):
+                logger.warning(
+                    f"JSON parsing error: {str(json_err)}, attempting to fix..."
+                )
+                fixed_content = content.replace('": "true"', '": true').replace(
+                    '": "false"', '": false'
+                )
+                try:
+                    parsed_response = json.loads(fixed_content)
+                    logger.info("Successfully fixed JSON format issues")
+                except json.JSONDecodeError as retry_err:
+                    logger.error(f"Failed to fix JSON format: {str(retry_err)}")
+                    raise
+            else:
+                raise
+
         commands = parsed_response.get("commands", [])
+
+        # Normalize command values - convert string booleans to actual booleans
+        for cmd in commands:
+            for key, value in cmd.items():
+                if isinstance(value, str):
+                    if value.lower() == "true":
+                        cmd[key] = True
+                    elif value.lower() == "false":
+                        cmd[key] = False
+                    # Also handle numeric strings
+                    elif value.isdigit():
+                        cmd[key] = int(value)
 
         if not commands:
             logger.warning("No commands generated from user input")

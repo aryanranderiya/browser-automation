@@ -1,4 +1,5 @@
 from typing import Dict
+import asyncio
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -22,25 +23,47 @@ class BrowserAction:
         """Execute a browser command and return result with status"""
         action = command.get("command_type")
         result = {"success": False, "message": "", "command": action}
-        # time.sleep(3)
+
         try:
+            # Wait a short time before executing any command to ensure the page has stabilized
+            try:
+                await asyncio.sleep(0.2)  # Brief pause for stability
+                # Check if we're still on a valid page before executing command
+                current_url = self.page.url
+                self.logger.info(f"Executing {action} on page: {current_url}")
+            except Exception as e:
+                self.logger.warning(
+                    f"URL access error before {action} command: {str(e)}"
+                )
+                await asyncio.sleep(1.0)  # Wait longer if there was an issue
+                # Try to recover, but continue with execution
+
             if action == "navigate":
                 url = command.get("url", "")
                 if not url.startswith(("http://", "https://")):
                     url = f"https://{url}"
 
                 self.logger.info(f"Navigating to {url}")
-                response = await self.page.goto(url, timeout=self.timeout * 1000)
-                if response and response.ok:
-                    result["success"] = True
-                    result["message"] = f"Successfully navigated to {url}"
-                else:
-                    error_msg = f"Navigation to {url} failed or timed out"
+                try:
+                    response = await self.page.goto(url, timeout=self.timeout * 1000)
+                    if response and response.ok:
+                        result["success"] = True
+                        result["message"] = f"Successfully navigated to {url}"
+                    else:
+                        error_msg = f"Navigation to {url} failed or timed out"
+                        result["message"] = error_msg
+                        raise NavigationError(
+                            error_msg,
+                            {
+                                "url": url,
+                                "status": response.status if response else None,
+                            },
+                        )
+                except PlaywrightTimeoutError as e:
+                    error_msg = f"Navigation to {url} timed out: {str(e)}"
+                    self.logger.error(error_msg)
                     result["message"] = error_msg
-                    raise NavigationError(
-                        error_msg,
-                        {"url": url, "status": response.status if response else None},
-                    )
+                    raise NavigationError(error_msg, {"url": url})
 
             elif action == "search":
                 selector = command.get("selector")
@@ -141,6 +164,17 @@ class BrowserAction:
                 self.logger.info(f"Clicking element {selector}")
 
                 try:
+                    # First wait for navigation to complete if one is in progress
+                    try:
+                        await self.page.wait_for_load_state(
+                            "domcontentloaded", timeout=5000
+                        )
+                    except PlaywrightTimeoutError:
+                        self.logger.warning(
+                            "Page load timeout before click, proceeding anyway"
+                        )
+
+                    # Then wait for the element to be ready
                     await self.page.wait_for_selector(
                         selector, timeout=self.timeout * 1000
                     )
@@ -149,9 +183,42 @@ class BrowserAction:
                     result["message"] = error_msg
                     raise ElementNotFoundError(error_msg, {"selector": selector})
 
-                await self.page.click(selector)
-                result["success"] = True
-                result["message"] = f"Clicked on element: {selector}"
+                # Execute the click with retry logic
+                retry_count = 0
+                max_retries = 2
+                while retry_count <= max_retries:
+                    try:
+                        await self.page.click(selector)
+                        result["success"] = True
+                        result["message"] = f"Clicked on element: {selector}"
+                        break
+                    except Exception as e:
+                        retry_count += 1
+                        if "Target closed" in str(
+                            e
+                        ) or "Execution context was destroyed" in str(e):
+                            if retry_count <= max_retries:
+                                self.logger.warning(
+                                    f"Execution context destroyed during click, retrying ({retry_count}/{max_retries})..."
+                                )
+                                await asyncio.sleep(
+                                    1.0
+                                )  # Wait for possible navigation to settle
+                                continue
+
+                        # If we've exhausted retries or it's another type of error, raise it
+                        if retry_count > max_retries:
+                            error_msg = f"Failed to click element after {max_retries} retries: {str(e)}"
+                        else:
+                            error_msg = f"Error clicking element: {str(e)}"
+
+                        result["message"] = error_msg
+                        raise ElementNotFoundError(
+                            error_msg, {"selector": selector, "error": str(e)}
+                        )
+
+                # After click, wait a moment for any navigation to start
+                await asyncio.sleep(0.5)
 
             elif action == "fill":
                 selector = command.get("selector")
@@ -492,6 +559,9 @@ class BrowserAction:
         except Exception as e:
             error_msg = f"Error executing {action}: {e}"
             self.logger.error(error_msg)
+            if "Execution context was destroyed" in str(e) or "Target closed" in str(e):
+                error_msg += " (Page navigation occurred during command execution)"
+
             result["message"] = error_msg
             raise BrowserAutomationError(
                 error_msg, {"command": action, "error": str(e)}

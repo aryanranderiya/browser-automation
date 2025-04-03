@@ -265,13 +265,58 @@ class BrowserSession:
 
                 # Get current page context if we've loaded a page
                 page_structure = None
-                current_url = self.page.url if self.page else ""
-                self.logger.info(f"Current URL: {current_url}")
+                current_url = ""
+
+                try:
+                    current_url = self.page.url if self.page else ""
+                    self.logger.info(f"Current URL: {current_url}")
+                except Exception as e:
+                    # Handle potential execution context destroyed errors when getting URL
+                    self.logger.warning(f"Error getting current URL: {str(e)}")
+                    # Wait a moment for any ongoing navigations to settle
+                    await asyncio.sleep(1.0)
+                    try:
+                        current_url = self.page.url if self.page else ""
+                        self.logger.info(
+                            f"Retry successful - Current URL: {current_url}"
+                        )
+                    except Exception as retry_err:
+                        self.logger.error(
+                            f"Still cannot get URL after retry: {str(retry_err)}"
+                        )
+                        current_url = "unknown (navigation in progress)"
 
                 if current_url and not current_url.startswith("about:"):
                     # Parse the current page to understand its structure
-                    page_structure = await extract_page_structure(self.page)
-                    self.logger.info(f"Extracted page structure from {current_url}")
+                    try:
+                        page_structure = await extract_page_structure(self.page)
+                        self.logger.info(f"Extracted page structure from {current_url}")
+                    except Exception as page_err:
+                        self.logger.warning(
+                            f"Error extracting page structure: {str(page_err)}"
+                        )
+                        # Wait for page to stabilize
+                        self.logger.info(
+                            "Waiting for page to stabilize after navigation..."
+                        )
+                        try:
+                            await self.page.wait_for_load_state(
+                                "domcontentloaded", timeout=5000
+                            )
+                            await asyncio.sleep(0.5)
+                            # Try extracting again
+                            page_structure = await extract_page_structure(self.page)
+                            self.logger.info(
+                                f"Successfully extracted page structure after waiting"
+                            )
+                        except Exception as retry_err:
+                            self.logger.error(
+                                f"Could not extract page structure after waiting: {str(retry_err)}"
+                            )
+                            page_structure = {
+                                "url": current_url,
+                                "error": str(retry_err),
+                            }
 
                 # Only get new commands if we're not waiting for captcha resolution
                 if not is_waiting_for_captcha:
