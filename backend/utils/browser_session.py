@@ -165,11 +165,29 @@ class BrowserSession:
             iterations = 0
             task_completed = False
             final_explanation = ""
+            is_waiting_for_captcha = False
+            captcha_result = None
 
             # Execute commands sequentially, with each new command based on the current page state
             while not task_completed and iterations < max_iterations:
                 iterations += 1
                 self.logger.info(f"Task iteration {iterations}/{max_iterations}")
+
+                # Check if we're resuming from a previous captcha pause
+                if is_waiting_for_captcha and self.captcha_resolved.is_set():
+                    self.logger.info("Resuming execution after captcha resolution")
+                    is_waiting_for_captcha = False
+
+                    # Add a result entry to indicate captcha was resolved
+                    captcha_resolution_result = {
+                        "success": True,
+                        "message": "Captcha was successfully resolved",
+                        "command": "captcha_resolved",
+                    }
+                    command_chain_results.append(captcha_resolution_result)
+
+                    # Clear the event for future captchas
+                    self.captcha_resolved.clear()
 
                 # Get current page context if we've loaded a page
                 page_structure = None
@@ -181,149 +199,168 @@ class BrowserSession:
                     page_structure = await extract_page_structure(self.page)
                     self.logger.info(f"Extracted page structure from {current_url}")
 
-                # Get commands from LLM based on current page state and previous actions
-                browser_commands = get_browser_commands(
-                    original_input,
-                    page_structure,
-                    command_chain_results if iterations > 1 else None,
-                )
-
-                if not browser_commands:
-                    self.logger.info(
-                        "No more commands to execute, task may be complete"
+                # Only get new commands if we're not waiting for captcha resolution
+                if not is_waiting_for_captcha:
+                    # Get commands from LLM based on current page state and previous actions
+                    browser_commands = get_browser_commands(
+                        original_input,
+                        page_structure,
+                        command_chain_results if iterations > 1 else None,
                     )
-                    break
 
-                # Check if we received a task_complete command type
-                if (
-                    len(browser_commands) == 1
-                    and browser_commands[0].get("command_type") == "task_complete"
-                ):
-                    task_completed = True
-                    final_explanation = browser_commands[0].get(
-                        "message", "Task completed successfully"
-                    )
-                    self.logger.info(
-                        f"Task completion signal received: {final_explanation}"
-                    )
-                    break
-
-                # Check for task_completed flag in any command
-                for cmd in browser_commands:
-                    if cmd.get("task_completed", False):
-                        task_completed = True
-                        final_explanation = cmd.get(
-                            "task_summary", "Task completed successfully"
-                        )
+                    if not browser_commands:
                         self.logger.info(
-                            f"Task completion flag found: {final_explanation}"
+                            "No more commands to execute, task may be complete"
                         )
                         break
+
+                    # Check if we received a task_complete command type
+                    if (
+                        len(browser_commands) == 1
+                        and browser_commands[0].get("command_type") == "task_complete"
+                    ):
+                        task_completed = True
+                        final_explanation = browser_commands[0].get(
+                            "message", "Task completed successfully"
+                        )
+                        self.logger.info(
+                            f"Task completion signal received: {final_explanation}"
+                        )
+                        break
+
+                    # Check for task_completed flag in any command
+                    for cmd in browser_commands:
+                        if cmd.get("task_completed", False):
+                            task_completed = True
+                            final_explanation = cmd.get(
+                                "task_summary", "Task completed successfully"
+                            )
+                            self.logger.info(
+                                f"Task completion flag found: {final_explanation}"
+                            )
+                            break
+                else:
+                    # If we're waiting for captcha, don't get new commands
+                    self.logger.info(
+                        "Waiting for captcha to be resolved before continuing"
+                    )
+
+                    # If captcha is already resolved, skip to next iteration
+                    if self.captcha_resolved.is_set():
+                        self.logger.info(
+                            "Captcha resolved, continuing to next iteration"
+                        )
+                        continue
+
+                    # Wait for a short time to see if captcha gets resolved
+                    try:
+                        await asyncio.wait_for(
+                            self.captcha_resolved.wait(), timeout=1.0
+                        )
+                        # If we get here, captcha was resolved during the wait
+                        continue
+                    except asyncio.TimeoutError:
+                        # Still waiting - let's add the waiting message to results
+                        if captcha_result:
+                            # Update the existing captcha result with waiting status
+                            captcha_result["message"] = (
+                                "Still waiting for captcha to be solved..."
+                            )
+                            captcha_result["elapsed_time"] = (
+                                time.time()
+                                - captcha_result.get("start_time", time.time())
+                            )
+
+                        # Sleep a bit longer before checking again
+                        await asyncio.sleep(1.0)
+                        continue
 
                 # Create an instance of BrowserAction to handle command execution
                 action_executor = BrowserAction(self.page, timeout=self.timeout)
                 iteration_results = []
 
-                # Execute each command in the sequence
-                for cmd in browser_commands:
-                    action = cmd.get("command_type", "")
-                    self.logger.info(f"Processing action: {action}")
+                # Execute each command in the sequence (only if not waiting for captcha)
+                if not is_waiting_for_captcha:
+                    for cmd in browser_commands:
+                        action = cmd.get("command_type", "")
+                        self.logger.info(f"Processing action: {action}")
 
-                    # Handle the wait_for_captcha action specially since it needs the Event object
-                    if action == "wait_for_captcha":
-                        message = cmd.get(
-                            "message",
-                            "Captcha detected. Please solve the captcha in the browser window.",
-                        )
-                        self.logger.info("Waiting for user to solve captcha")
-
-                        # Reset the event (in case it was set previously)
-                        self.captcha_resolved.clear()
-
-                        if self.wait_for_captcha:
-                            # Wait for the captcha to be resolved - this will be resumed via the API
-                            result = {
-                                "success": True,
-                                "message": message,
-                                "command": action,
-                                "waiting_for_user": True,
-                            }
-
-                            # Wait for the event to be set
-                            try:
-                                await asyncio.wait_for(
-                                    self.captcha_resolved.wait(), timeout=300
-                                )  # 5 minute timeout
-                                self.logger.info(
-                                    "Captcha resolution received, continuing execution"
-                                )
-                                result["message"] = (
-                                    "Captcha solved, continuing with automation"
-                                )
-                            except asyncio.TimeoutError:
-                                self.logger.warning(
-                                    "Timeout waiting for captcha resolution"
-                                )
-                                result["message"] = (
-                                    "Timeout waiting for captcha to be solved"
-                                )
-                                result["success"] = False
-                        else:
-                            # If wait_for_captcha is False, just log and continue without waiting
-                            result = {
-                                "success": False,
-                                "message": "Captcha detected but automatic waiting is disabled. Enable 'wait_for_captcha' to pause execution.",
-                                "command": action,
-                            }
-                    else:
-                        # For all other actions, use the BrowserAction executor
-                        try:
-                            self.logger.info(f"Executing command: {cmd}")
-                            result = await action_executor.execute(cmd)
-                        except Exception as e:
-                            self.logger.error(
-                                f"Error executing action {action}: {str(e)}"
+                        # Handle the wait_for_captcha action specially since it needs the Event object
+                        if action == "wait_for_captcha":
+                            message = cmd.get(
+                                "message",
+                                "Captcha detected. Please solve the captcha in the browser window.",
                             )
-                            result = {
-                                "success": False,
-                                "message": f"Error executing {action}: {str(e)}",
-                                "command": action,
-                            }
+                            self.logger.info("Waiting for user to solve captcha")
 
-                    iteration_results.append(result)
-                    command_chain_results.append(result)
+                            # Reset the event (in case it was set previously)
+                            self.captcha_resolved.clear()
 
-                    # If this action failed and it's a critical action, stop processing this iteration
-                    if not result["success"] and action in [
-                        "navigate",
-                        "click",
-                        "fill",
-                    ]:
-                        self.logger.warning(
-                            f"Critical action {action} failed, stopping command execution for this iteration"
-                        )
-                        break
+                            if self.wait_for_captcha:
+                                # Mark that we're waiting for captcha resolution
+                                is_waiting_for_captcha = True
 
-                    # If we're waiting for captcha and the action was successful, don't process any further commands
-                    if action == "wait_for_captcha" and result.get(
-                        "waiting_for_user", False
-                    ):
-                        self.logger.info(
-                            "Pausing command execution while waiting for captcha resolution"
-                        )
-                        break
+                                # Create a result that indicates we're waiting for user input
+                                captcha_result = {
+                                    "success": True,
+                                    "message": message,
+                                    "command": action,
+                                    "waiting_for_user": True,
+                                    "start_time": time.time(),
+                                }
 
-                    # After navigation, we should stop and re-evaluate the new page
-                    if action == "navigate" and result["success"]:
-                        self.logger.info(
-                            "Stopping after navigation to evaluate new page in next iteration"
-                        )
-                        break
+                                iteration_results.append(captcha_result)
+                                command_chain_results.append(captcha_result)
+
+                                # Don't wait here - break out and let the next iteration handle waiting
+                                break
+                            else:
+                                # If wait_for_captcha is False, just log and continue without waiting
+                                result = {
+                                    "success": False,
+                                    "message": "Captcha detected but automatic waiting is disabled. Enable 'wait_for_captcha' to pause execution.",
+                                    "command": action,
+                                }
+                                iteration_results.append(result)
+                                command_chain_results.append(result)
+                        else:
+                            # For all other actions, use the BrowserAction executor
+                            try:
+                                self.logger.info(f"Executing command: {cmd}")
+                                result = await action_executor.execute(cmd)
+                            except Exception as e:
+                                self.logger.error(
+                                    f"Error executing action {action}: {str(e)}"
+                                )
+                                result = {
+                                    "success": False,
+                                    "message": f"Error executing {action}: {str(e)}",
+                                    "command": action,
+                                }
+
+                            iteration_results.append(result)
+                            command_chain_results.append(result)
+
+                            # If this action failed and it's a critical action, stop processing this iteration
+                            if not result["success"] and action in [
+                                "navigate",
+                                "click",
+                                "fill",
+                            ]:
+                                self.logger.warning(
+                                    f"Critical action {action} failed, stopping command execution for this iteration"
+                                )
+                                break
+
+                            # After navigation, we should stop and re-evaluate the new page
+                            if action == "navigate" and result["success"]:
+                                self.logger.info(
+                                    "Stopping after navigation to evaluate new page in next iteration"
+                                )
+                                break
 
                 # Short delay between iterations to prevent overloading the browser
-                await asyncio.sleep(
-                    0.5
-                )  # Reduced from 1 second to 0.5 seconds for faster execution
+                await asyncio.sleep(0.5)
 
                 # Generate an interim explanation for this iteration
                 if (
@@ -335,6 +372,24 @@ class BrowserSession:
                     self.logger.info(
                         f"Iteration {iterations} progress: {interim_explanation}"
                     )
+
+                # Handle the case when we're waiting for captcha
+                if is_waiting_for_captcha:
+                    # If we're waiting for captcha and have been waiting for more than 5 minutes, time out
+                    elapsed_time = time.time() - captcha_result.get(
+                        "start_time", time.time()
+                    )
+                    if elapsed_time > 300:  # 5 minutes timeout
+                        self.logger.warning(
+                            "Timeout waiting for captcha resolution after 5 minutes"
+                        )
+                        captcha_result["message"] = (
+                            "Timeout waiting for captcha to be solved"
+                        )
+                        captcha_result["success"] = False
+                        captcha_result["waiting_for_user"] = False
+                        is_waiting_for_captcha = False
+                        break
 
             # Generate the final explanation of what was done
             if task_completed and final_explanation:

@@ -85,8 +85,7 @@ IMPORTANT RULES:
 5. Do NOT group commands that would trigger page navigation or significant page changes - these should be separate.
 6. If a requested element doesn't exist in the page structure, use extract_text  to gather more information.
 7. If you detect a captcha or security challenge on the page (look for elements with text containing 'captcha', 'robot', 'human verification', 'security check'), use the 'wait_for_captcha' command.
-8. For dynamic content that might load after a user action, include a wait command or wait_for_selector command before interacting with the new elements.
-9. CONSIDER THE HISTORY of previously executed commands when deciding the next step. Don't repeat actions that have already been done.
+8. CONSIDER THE HISTORY of previously executed commands when deciding the next step. Don't repeat actions that have already been done.
 
 For navigation commands, always include the full URL. If a URL doesn't include "http://" or "https://", "https://" will be added automatically.
 

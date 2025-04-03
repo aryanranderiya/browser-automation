@@ -277,14 +277,32 @@ async def get_session_status(session_id: str):
 
         status = await session_manager.get_session_status(session_id)
 
-        # Check if there's a command that's waiting for captcha resolution
+        # Check for active captcha resolution wait
         is_waiting_for_captcha = False
-        for cmd in session.command_queue:
-            if cmd.processed and cmd.result:
-                results = cmd.result.get("results", [])
-                if any(r.get("waiting_for_user", False) for r in results):
-                    is_waiting_for_captcha = True
-                    break
+
+        # Method 1: Check current command results for waiting_for_user flag
+        if session.current_command and session.current_command.result:
+            results = session.current_command.result.get("results", [])
+            if any(r.get("waiting_for_user", False) for r in results):
+                is_waiting_for_captcha = True
+
+        # Method 2: Check command queue for any command waiting for captcha
+        if not is_waiting_for_captcha:
+            for cmd in session.command_queue:
+                if cmd.processed and cmd.result:
+                    results = cmd.result.get("results", [])
+                    if any(r.get("waiting_for_user", False) for r in results):
+                        is_waiting_for_captcha = True
+                        break
+
+        # Method 3: Directly check if the captcha_resolved event is cleared (not set)
+        # This means we're waiting for it to be set by the user
+        if not is_waiting_for_captcha and not session.captcha_resolved.is_set():
+            # Only consider this if we have at least one processed command
+            processed_commands = [cmd for cmd in session.command_queue if cmd.processed]
+            if processed_commands and session.is_processing:
+                # If we're actively processing and the event isn't set, we might be waiting
+                is_waiting_for_captcha = True
 
         return {
             "status": "waiting_for_captcha" if is_waiting_for_captcha else "active",

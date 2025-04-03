@@ -156,6 +156,9 @@ export default function BrowserAutomation() {
 
       const response = await api.executeCommand(sessionId, userInput, 60);
 
+      // Clear input immediately after sending command
+      setUserInput("");
+
       // If we got a command ID, start polling for status
       if (response.details?.command_id) {
         setCurrentCommandId(response.details.command_id);
@@ -235,15 +238,11 @@ export default function BrowserAutomation() {
             // If command is completed, stop polling
             if (
               status.status === "completed" &&
-              status.task_status === "completed"
+              status.task_status === "completed" &&
+              statusCheckInterval.current
             ) {
-              if (statusCheckInterval.current) {
-                clearInterval(statusCheckInterval.current);
-                statusCheckInterval.current = null;
-              }
-
-              // Clear input
-              setUserInput("");
+              clearInterval(statusCheckInterval.current);
+              statusCheckInterval.current = null;
             }
           } catch (err) {
             console.error("Error checking command status:", err);
@@ -534,7 +533,7 @@ export default function BrowserAutomation() {
                                         clipRule="evenodd"
                                       ></path>
                                     </svg>
-                                  ) : (
+                                  ) : step.action /* Only show failed icon if there's an action name */ ? (
                                     <svg
                                       className="flex-shrink-0 w-4 h-4 mr-1.5 text-red-500"
                                       fill="currentColor"
@@ -546,7 +545,7 @@ export default function BrowserAutomation() {
                                         clipRule="evenodd"
                                       ></path>
                                     </svg>
-                                  )}
+                                  ) : null}
                                   <div className="text-xs">
                                     <span>{step.action}</span>
                                     {step.message && (
