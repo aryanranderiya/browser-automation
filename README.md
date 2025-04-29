@@ -1,6 +1,6 @@
 # CrustData Browser Automation
 
-A powerful browser automation platform with a FastAPI backend and Next.js frontend for automating web interactions with natural language commands
+A powerful browser automation platform with a FastAPI backend and Next.js frontend for automating web interactions with natural language commands.
 
 ## Project Overview
 
