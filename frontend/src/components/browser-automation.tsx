@@ -260,7 +260,7 @@ export default function BrowserAutomation() {
               )
             );
           }
-        }, 1000);
+        }, 5000);
       }
     } catch (err: any) {
       setError(`Failed to execute command: ${err.message}`);
